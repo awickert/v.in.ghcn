@@ -140,13 +140,17 @@ def get_geographic_bbox():
     proj = gs.parse_command('g.proj', flags='g')
     region = gs.region()
 
-    if proj.get('proj') == 'longlat':
+    if proj.get('proj') in ('ll', 'longlat'):
         return region['w'], region['s'], region['e'], region['n']
 
+    import subprocess as _sp
     coords = "{} {}\n{} {}".format(
         region['w'], region['s'], region['e'], region['n']
     )
-    out = gs.read_command('m.proj', flags='i', stdin=coords).strip().split('\n')
+    proc = gs.start_command('m.proj', flags='i',
+                            stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.PIPE)
+    stdout, _ = proc.communicate(coords.encode())
+    out = stdout.decode().strip().split('\n')
     sw = [float(v) for v in out[0].split()[:2]]
     ne = [float(v) for v in out[1].split()[:2]]
     return sw[0], sw[1], ne[0], ne[1]
