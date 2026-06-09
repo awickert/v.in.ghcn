@@ -417,7 +417,6 @@ def main():
         ids, cat_map, set(elements), start_date, end_date, q_flags, table_name
     )
 
-    gs.message("")
     gs.message("Time series stored: table '{}', {:,} records.".format(table_name, total))
     gs.message("Query example:")
     gs.message("  db.select sql=\"SELECT datetime, value FROM {t} WHERE cat=1 AND element='PRCP' LIMIT 10\"".format(
