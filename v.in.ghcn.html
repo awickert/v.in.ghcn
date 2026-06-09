@@ -1,0 +1,112 @@
+<h2>DESCRIPTION</h2>
+
+<em>v.in.ghcn</em> downloads station locations and climate time series from
+the <a href="https://www.ncei.noaa.gov/products/land-based-station/global-historical-climatology-network-daily">NOAA Global Historical Climatology Network (GHCN)</a>
+and imports them into GRASS GIS.
+
+<p>
+Station locations are imported as a vector point map (layer 1 attribute
+table). When a time series is requested, records are written to a
+secondary SQLite table named <tt>&lt;output&gt;_timeseries</tt> in the
+mapset database, keyed on the GRASS category (<tt>cat</tt>) and
+<tt>station_id</tt>.
+</p>
+
+<p>
+By default, the module searches for stations within the current
+computational region. An explicit list of station IDs may be supplied
+instead via the <b>stations</b> option. No authentication is required;
+data are fetched directly from NOAA NCEI over HTTPS.
+</p>
+
+<h2>NOTES</h2>
+
+<h3>Time series behaviour</h3>
+
+Time series download is the default behaviour. Use <b>-l</b> to import
+station locations only.
+
+<p>
+If neither <b>start_date</b> nor <b>end_date</b> is given, the full
+available record for each station is downloaded. If only one bound is
+given, the other defaults to the station record start or today,
+respectively.
+</p>
+
+<h3>Units</h3>
+
+GHCN raw values for <tt>PRCP</tt>, <tt>TMAX</tt>, and <tt>TMIN</tt>
+are stored in tenths of the standard unit. <em>v.in.ghcn</em>
+converts these to mm and degrees C on import. <tt>SNOW</tt> and
+<tt>SNWD</tt> are already in mm and are not modified.
+
+<h3>Quality flags</h3>
+
+With <b>q_flags=strict</b> (default), only records with a blank quality
+flag (passed all NCEI quality checks) are imported. Use
+<b>q_flags=all</b> to include records regardless of QC status.
+
+<h3>Time series table schema</h3>
+
+<div class="code"><pre>
+cat        INTEGER   -- GRASS category (links to station geometry)
+station_id TEXT      -- GHCN station identifier
+datetime   TEXT      -- ISO 8601 date (YYYY-MM-DD)
+element    TEXT      -- PRCP, SNOW, SNWD, TMAX, TMIN, ...
+value      REAL      -- converted to standard units (mm or degrees C)
+q_flag     TEXT      -- quality flag (NULL if blank/passed)
+</pre></div>
+
+An index on <tt>(cat, element, datetime)</tt> is created automatically.
+
+<h3>Querying the time series</h3>
+
+<div class="code"><pre>
+# All PRCP records for cat 1
+db.select sql="SELECT datetime, value FROM gauges_timeseries WHERE cat=1 AND element='PRCP'"
+
+# Annual precipitation totals for all stations
+db.select sql="SELECT station_id, substr(datetime,1,4) AS year, SUM(value) AS prcp_mm \
+  FROM gauges_timeseries WHERE element='PRCP' GROUP BY station_id, year"
+</pre></div>
+
+<h2>EXAMPLES</h2>
+
+Import station locations and full PRCP record within the current region:
+<div class="code"><pre>
+v.in.ghcn output=gauges
+</pre></div>
+
+Import PRCP and TMAX for 2000–2020, requiring at least 15 years of record:
+<div class="code"><pre>
+v.in.ghcn output=gauges elements=PRCP,TMAX start_date=2000-01-01 end_date=2020-12-31 min_years=15
+</pre></div>
+
+Import specific stations by ID:
+<div class="code"><pre>
+v.in.ghcn output=msp stations=USW00014922,USC00218450 start_date=1980-01-01
+</pre></div>
+
+Import station locations only (no time series):
+<div class="code"><pre>
+v.in.ghcn output=gauges -l
+</pre></div>
+
+<h2>REQUIREMENTS</h2>
+
+<ul>
+  <li>Python packages: <tt>requests</tt>, <tt>pandas</tt>, <tt>geopandas</tt>, <tt>shapely</tt></li>
+</ul>
+
+<h2>SEE ALSO</h2>
+
+<em>
+<a href="v.in.nwis.html">v.in.nwis</a>,
+<a href="db.select.html">db.select</a>,
+<a href="v.db.select.html">v.db.select</a>,
+<a href="t.create.html">t.create</a>
+</em>
+
+<h2>AUTHOR</h2>
+
+Andrew Wickert
