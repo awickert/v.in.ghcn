@@ -62,6 +62,15 @@ temperature.
 </p>
 
 <p>
+Hourly data is not supported. GHCNh does not expose per-station bulk
+files; access requires the NCEI web API with date-bounded queries.
+More importantly, GHCNh contains synoptic meteorological variables
+(temperature, humidity, wind, pressure) and does not include
+precipitation. For hourly surface observations, use the NOAA Integrated
+Surface Database (ISD) instead.
+</p>
+
+<p>
 For monthly imports, stations are pre-filtered using the GHCNd element
 inventory to identify those with any PRCP record. Stations present in GHCNd
 but absent from the GHCNm precipitation dataset are silently skipped (the
