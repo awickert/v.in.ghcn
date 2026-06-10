@@ -111,7 +111,10 @@ if not os.environ.get('PROJ_DATA') and not os.environ.get('PROJ_LIB'):
 
 TMPFILES = []
 
-_GHCND_BASE = 'https://www.ncei.noaa.gov/pub/data/ghcn/daily'
+_GHCND_BASE  = 'https://www.ncei.noaa.gov/pub/data/ghcn/daily'
+_GHCNM_PRCP_BASE = ('https://www.ncei.noaa.gov/data/'
+                    'global-historical-climatology-network-monthly/'
+                    'v4/precipitation/access')
 
 # Elements whose raw values are in tenths of the standard unit
 _TENTHS_ELEMENTS = {'PRCP', 'TMAX', 'TMIN', 'TOBS', 'AWND', 'EVAP', 'WDMV'}
@@ -361,6 +364,107 @@ def fetch_and_write_timeseries(station_ids, cat_map, elements, start_date, end_d
     return total_rows
 
 
+def fetch_and_write_monthly_timeseries(station_ids, cat_map, start_date, end_date,
+                                       q_flags, table_name):
+    """Download per-station GHCNm precipitation CSVs and write to mapset SQLite."""
+    import requests
+
+    gisenv = gs.gisenv()
+    db_dir = os.path.join(
+        gisenv['GISDBASE'], gisenv['LOCATION_NAME'], gisenv['MAPSET'], 'sqlite'
+    )
+    os.makedirs(db_dir, exist_ok=True)
+    db_path = os.path.join(db_dir, 'sqlite.db')
+
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute('DROP TABLE IF EXISTS "{}"'.format(table_name))
+    cur.execute('''
+        CREATE TABLE "{}" (
+            cat        INTEGER,
+            station_id TEXT,
+            datetime   TEXT,
+            element    TEXT,
+            value      REAL,
+            q_flag     TEXT
+        )
+    '''.format(table_name))
+    cur.execute(
+        'CREATE INDEX "{}_idx" ON "{}" (cat, element, datetime)'.format(
+            table_name, table_name)
+    )
+    conn.commit()
+
+    # Convert YYYY-MM-DD date bounds to integer YYYYMM for fast comparison
+    start_ym = int(start_date[:4] + start_date[5:7]) if start_date else None
+    end_ym   = int(end_date[:4]   + end_date[5:7])   if end_date   else None
+
+    total_rows = 0
+    for station_id in station_ids:
+        cat = cat_map.get(station_id)
+        if cat is None:
+            gs.warning("No cat found for station {}; skipping.".format(station_id))
+            continue
+
+        url = '{}/{}.csv'.format(_GHCNM_PRCP_BASE, station_id)
+        try:
+            r = requests.get(url, timeout=60)
+            if r.status_code == 404:
+                gs.verbose(
+                    "  {} not in GHCNm precipitation dataset; skipping.".format(station_id)
+                )
+                continue
+            r.raise_for_status()
+        except Exception as e:
+            gs.warning("Could not fetch {}: {}".format(station_id, e))
+            continue
+
+        rows = []
+        for rec in csv.reader(r.text.splitlines()):
+            if len(rec) < 9:
+                continue
+            # cols: 0=station_id 1=name 2=lat 3=lon 4=elev
+            #       5=YYYYMM 6=value(tenths mm) 7=dm_flag 8=qc_flag 9=ds_flag
+            try:
+                yyyymm = int(rec[5].strip())
+            except ValueError:
+                continue
+
+            if start_ym and yyyymm < start_ym:
+                continue
+            if end_ym and yyyymm > end_ym:
+                continue
+
+            qc_flag = rec[8].strip()
+            if q_flags == 'strict' and qc_flag:
+                continue
+
+            try:
+                val = float(rec[6].strip())
+                if val == -9999:
+                    continue
+                val = val / 10.0   # tenths of mm → mm
+            except ValueError:
+                continue
+
+            year  = yyyymm // 100
+            month = yyyymm  % 100
+            dt = '{:04d}-{:02d}-01'.format(year, month)
+
+            rows.append((cat, station_id, dt, 'PRCP', val, qc_flag or None))
+
+        if rows:
+            cur.executemany(
+                'INSERT INTO "{}" VALUES (?, ?, ?, ?, ?, ?)'.format(table_name), rows
+            )
+            conn.commit()
+            total_rows += len(rows)
+        gs.message("  {} → {:,} records".format(station_id, len(rows)))
+
+    conn.close()
+    return total_rows
+
+
 def main():
     options, flags = gs.parser()
     atexit.register(cleanup)
@@ -376,7 +480,12 @@ def main():
     flag_locations = flags['l']
 
     if frequency == 'monthly':
-        gs.fatal("Monthly frequency is not yet implemented.")
+        non_prcp = [e for e in elements_str.split(',') if e.strip().upper() != 'PRCP']
+        if non_prcp:
+            gs.warning(
+                "Monthly frequency only supports PRCP. "
+                "Elements '{}' will be skipped.".format(', '.join(non_prcp))
+            )
 
     require_package('requests')
     require_package('pandas')
@@ -384,6 +493,8 @@ def main():
     require_package('shapely')
 
     elements = [e.strip().upper() for e in elements_str.split(',')]
+    if frequency == 'monthly':
+        elements = ['PRCP']   # GHCNm precipitation only; used for element inventory filter
     station_ids = [s.strip() for s in stations_str.split(',')] if stations_str else None
     bbox = None if station_ids else get_geographic_bbox()
 
@@ -413,9 +524,15 @@ def main():
 
     table_name = '{}_timeseries'.format(output)
     gs.message("Fetching time series for {} station(s)...".format(len(ids)))
-    total = fetch_and_write_timeseries(
-        ids, cat_map, set(elements), start_date, end_date, q_flags, table_name
-    )
+
+    if frequency == 'monthly':
+        total = fetch_and_write_monthly_timeseries(
+            ids, cat_map, start_date, end_date, q_flags, table_name
+        )
+    else:
+        total = fetch_and_write_timeseries(
+            ids, cat_map, set(elements), start_date, end_date, q_flags, table_name
+        )
 
     gs.message("Time series stored: table '{}', {:,} records.".format(table_name, total))
     gs.message("Query example:")

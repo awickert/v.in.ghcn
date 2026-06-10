@@ -33,6 +33,41 @@ given, the other defaults to the station record start or today,
 respectively.
 </p>
 
+<h3>Frequency and data sources</h3>
+
+<table>
+  <tr>
+    <th>frequency=</th><th>Source</th><th>Elements</th><th>Access</th>
+  </tr>
+  <tr>
+    <td>daily</td>
+    <td>GHCNd</td>
+    <td>PRCP, SNOW, SNWD, TMAX, TMIN, and others</td>
+    <td>Per-station gzip CSV (HTTPS, no auth)</td>
+  </tr>
+  <tr>
+    <td>monthly</td>
+    <td>GHCNm v4 precipitation</td>
+    <td>PRCP only</td>
+    <td>Per-station CSV (HTTPS, no auth)</td>
+  </tr>
+</table>
+
+<p>
+Monthly temperature (TAVG) is distributed as a single 170 MB global flat
+file and is not supported. Use
+<em><a href="r.in.gridmet.html">r.in.gridmet</a></em> or
+<em><a href="r.in.prism.html">r.in.prism</a></em> for gridded monthly
+temperature.
+</p>
+
+<p>
+For monthly imports, stations are pre-filtered using the GHCNd element
+inventory to identify those with any PRCP record. Stations present in GHCNd
+but absent from the GHCNm precipitation dataset are silently skipped (the
+two datasets have different coverage).
+</p>
+
 <h3>Units</h3>
 
 GHCN raw values for <tt>PRCP</tt>, <tt>TMAX</tt>, and <tt>TMIN</tt>
@@ -85,6 +120,11 @@ v.in.ghcn output=gauges elements=PRCP,TMAX start_date=2000-01-01 end_date=2020-1
 Import specific stations by ID:
 <div class="code"><pre>
 v.in.ghcn output=msp stations=USW00014922,USC00218450 start_date=1980-01-01
+</pre></div>
+
+Import monthly precipitation for 1950–2020:
+<div class="code"><pre>
+v.in.ghcn output=gauges_mo frequency=monthly start_date=1950-01-01 end_date=2020-12-31
 </pre></div>
 
 Import station locations only (no time series):
