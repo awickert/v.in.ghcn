@@ -79,6 +79,21 @@
 #%end
 
 #%option
+#%  key: padding
+#%  type: double
+#%  label: Expand region bounding box by this many degrees in each direction
+#%  required: no
+#%  answer: 0
+#%end
+
+#%option
+#%  key: min_stations
+#%  type: integer
+#%  label: Minimum number of stations; bbox is expanded by 0.5 degrees per step until satisfied
+#%  required: no
+#%end
+
+#%option
 #%  key: q_flags
 #%  type: string
 #%  label: Quality flag filter
@@ -216,8 +231,12 @@ def fetch_element_inventory():
 
 
 def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_years,
-                    start_date, end_date):
-    """Filter station inventory to bbox/IDs, requested elements, and min_years."""
+                    start_date, end_date, fatal=True):
+    """Filter station inventory to bbox/IDs, requested elements, and min_years.
+
+    When fatal=False an empty DataFrame is returned instead of calling gs.fatal
+    for the bbox-empty case; used by the adaptive expansion loop.
+    """
     if station_ids:
         df = station_df[station_df['station_id'].isin(station_ids)].copy()
         if df.empty:
@@ -231,6 +250,8 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
             (station_df['longitude'] <= east)
         ].copy()
         if df.empty:
+            if not fatal:
+                return df
             gs.fatal("No stations found within the current region.")
 
     # Keep only stations that have at least one requested element on record
@@ -475,8 +496,10 @@ def main():
     elements_str = options['elements']
     start_date = options['start_date'] or None
     end_date = options['end_date'] or None
-    min_years = int(options['min_years']) if options['min_years'] else None
-    q_flags = options['q_flags']
+    min_years     = int(options['min_years'])     if options['min_years']     else None
+    padding       = float(options['padding'])     if options['padding']       else 0.0
+    min_stations  = int(options['min_stations'])  if options['min_stations']  else None
+    q_flags       = options['q_flags']
     flag_locations = flags['l']
 
     if frequency == 'monthly':
@@ -501,11 +524,46 @@ def main():
     if not flag_locations and not end_date:
         end_date = date.today().isoformat()
 
+    # Apply fixed padding to bbox
+    if bbox and padding > 0.0:
+        w, s, e, n = bbox
+        bbox = (w - padding, s - padding, e + padding, n + padding)
+        gs.message("Padding bbox by {:.3g}°: W={:.4f} S={:.4f} E={:.4f} N={:.4f}".format(
+            padding, *bbox))
+
     station_df = fetch_station_inventory()
     elem_inv_df = fetch_element_inventory()
 
-    filtered = filter_stations(station_df, elem_inv_df, bbox, station_ids,
-                               elements, min_years, start_date, end_date)
+    # Adaptive expansion: grow bbox by 0.5° per step until min_stations is reached
+    if min_stations and not station_ids:
+        _STEP = 0.5   # degrees per expansion step
+        _MAX  = 10.0  # maximum total expansion in each direction
+        w, s, e, n = bbox
+        expansion = 0.0
+        while True:
+            filtered = filter_stations(station_df, elem_inv_df, (w, s, e, n),
+                                       None, elements, min_years,
+                                       start_date, end_date, fatal=False)
+            if len(filtered) >= min_stations:
+                break
+            expansion += _STEP
+            if expansion > _MAX:
+                gs.fatal(
+                    "Could not find {} stations within {:.0f}° of the region "
+                    "(found {}). Loosen min_years or min_stations.".format(
+                        min_stations, _MAX, len(filtered)))
+            w -= _STEP; s -= _STEP; e += _STEP; n += _STEP
+            gs.message(
+                "  {}/{} stations — expanding bbox by {:.1f}° "
+                "(total expansion: {:.1f}°)".format(
+                    len(filtered), min_stations, _STEP, expansion))
+        if expansion > 0.0:
+            gs.message(
+                "min_stations={} satisfied after {:.1f}° expansion "
+                "({} stations).".format(min_stations, expansion, len(filtered)))
+    else:
+        filtered = filter_stations(station_df, elem_inv_df, bbox, station_ids,
+                                   elements, min_years, start_date, end_date)
 
     import geopandas as gpd
     from shapely.geometry import Point
