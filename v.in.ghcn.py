@@ -120,9 +120,8 @@ from datetime import date
 
 import grass.script as gs
 
-if not os.environ.get('PROJ_DATA') and not os.environ.get('PROJ_LIB'):
-    if os.path.exists('/usr/share/proj/proj.db'):
-        os.environ['PROJ_DATA'] = '/usr/share/proj'
+if os.path.exists('/usr/share/proj/proj.db'):
+    os.environ['PROJ_DATA'] = '/usr/share/proj'
 
 TMPFILES = []
 
