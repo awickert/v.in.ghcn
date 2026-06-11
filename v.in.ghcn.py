@@ -188,7 +188,7 @@ def geodataframe_to_grass(gdf, output):
             gdf[col] = gdf[col].astype(str).astype(object)
 
     gdf.to_file(tmp, driver='GPKG')
-    gs.run_command('v.in.ogr', input=tmp, output=output,
+    gs.run_command('v.import', input=tmp, output=output,
                    overwrite=gs.overwrite(), quiet=True)
 
 
