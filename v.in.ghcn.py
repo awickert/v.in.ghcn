@@ -231,8 +231,13 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
                     start_date, end_date, fatal=True):
     """Filter station inventory to bbox/IDs, requested elements, and min_years.
 
-    When fatal=False an empty DataFrame is returned instead of calling gs.fatal
-    for the bbox-empty case; used by the adaptive expansion loop.
+    Returns (df, per_element_counts) where per_element_counts maps each requested
+    element to the number of stations that carry it with sufficient years of record.
+    A station qualifies for the overall df if it has ANY element with enough years;
+    per_element_counts reflects how many stations have EACH element specifically.
+
+    When fatal=False an empty DataFrame is returned (with empty counts) instead of
+    calling gs.fatal for the bbox-empty case; used by the adaptive expansion loop.
     """
     if station_ids:
         df = station_df[station_df['station_id'].isin(station_ids)].copy()
@@ -248,7 +253,7 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
         ].copy()
         if df.empty:
             if not fatal:
-                return df
+                return df, {}
             gs.fatal("No stations found within the current region.")
 
     # Keep only stations that have at least one requested element on record
@@ -259,7 +264,10 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
         gs.fatal("No stations have any of the requested elements: {}.".format(
             ', '.join(elements)))
 
-    # min_years filter
+    sids_in_df = set(df['station_id'])
+
+    # Compute per-element station counts and apply min_years filter
+    per_element_counts = {}
     if min_years:
         end_yr = int(end_date[:4]) if end_date else date.today().year
         ef = elem_inv_df[elem_inv_df['element'].isin(elements)].copy()
@@ -271,13 +279,100 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
             ef['eff_first'] = ef['firstyear']
         ef['eff_last'] = ef['lastyear'].clip(upper=end_yr)
         ef['record_years'] = ef['eff_last'] - ef['eff_first'] + 1
-        sufficient = set(ef[ef['record_years'] >= min_years]['station_id'].unique())
+        ef_sufficient = ef[ef['record_years'] >= min_years]
+
+        for elem in elements:
+            per_element_counts[elem] = len(
+                set(ef_sufficient[ef_sufficient['element'] == elem]['station_id'])
+                & sids_in_df
+            )
+
+        sufficient = set(ef_sufficient['station_id'].unique())
         df = df[df['station_id'].isin(sufficient)]
         if df.empty:
             gs.fatal("No stations pass the min_years={} filter.".format(min_years))
+    else:
+        for elem in elements:
+            per_element_counts[elem] = len(
+                set(elem_inv_df[elem_inv_df['element'] == elem]['station_id'])
+                & sids_in_df
+            )
 
-    gs.message("Found {} station(s).".format(len(df)))
-    return df.reset_index(drop=True)
+    gs.message("Found {} station(s) — per element: {}".format(
+        len(df),
+        ', '.join('{}={}'.format(e, per_element_counts.get(e, 0)) for e in elements)
+    ))
+    return df.reset_index(drop=True), per_element_counts
+
+
+def _year_ranges(years):
+    """Convert a sorted list of integers to a compact range string like '1890-1920, 1945'."""
+    if not years:
+        return ''
+    ranges = []
+    start = prev = years[0]
+    for y in years[1:]:
+        if y == prev + 1:
+            prev = y
+        else:
+            ranges.append((start, prev))
+            start = prev = y
+    ranges.append((start, prev))
+    return ', '.join(str(a) if a == b else '{}-{}'.format(a, b) for a, b in ranges)
+
+
+def report_temporal_coverage(df, elem_inv_df, elements, start_date, end_date,
+                              sparse_threshold=4):
+    """Report per-year station counts per element; warn about sparse periods.
+
+    sparse_threshold: years with fewer than this many active stations generate
+    a warning (default 4 matches v.interp.timeseries npoints default).
+    """
+    sids = set(df['station_id'])
+    ef = elem_inv_df[
+        elem_inv_df['element'].isin(elements) &
+        elem_inv_df['station_id'].isin(sids)
+    ].copy()
+
+    end_yr = int(end_date[:4]) if end_date else date.today().year
+    if start_date:
+        start_yr = int(start_date[:4])
+    else:
+        start_yr = int(ef['firstyear'].min()) if not ef.empty else end_yr
+
+    years = list(range(start_yr, end_yr + 1))
+    if not years:
+        return
+
+    gs.message("Temporal coverage ({}-{}, active stations per element):".format(
+        start_yr, end_yr))
+
+    for elem in elements:
+        ef_e = ef[ef['element'] == elem]
+        if ef_e.empty:
+            gs.warning("  {}: no stations in inventory for this element.".format(elem))
+            continue
+
+        counts = [
+            int(((ef_e['firstyear'] <= yr) & (ef_e['lastyear'] >= yr)).sum())
+            for yr in years
+        ]
+
+        min_n  = min(counts)
+        max_n  = max(counts)
+        mean_n = sum(counts) / len(counts)
+
+        # Year with minimum coverage
+        min_yr = years[counts.index(min_n)]
+
+        gs.message("  {}: min={} ({}), mean={:.1f}, max={}".format(
+            elem, min_n, min_yr, mean_n, max_n))
+
+        sparse = sorted(yr for yr, n in zip(years, counts) if n < sparse_threshold)
+        if sparse:
+            gs.warning(
+                "  {}: {} year(s) with < {} station(s): {}".format(
+                    elem, len(sparse), sparse_threshold, _year_ranges(sparse)))
 
 
 def get_cat_map(output):
@@ -532,35 +627,42 @@ def main():
     elem_inv_df = fetch_element_inventory()
 
     # Adaptive expansion: grow bbox by 0.5° per step until min_stations is reached
+    # for EACH requested element independently.
     if min_stations and not station_ids:
         _STEP = 0.5   # degrees per expansion step
         _MAX  = 10.0  # maximum total expansion in each direction
         w, s, e, n = bbox
         expansion = 0.0
         while True:
-            filtered = filter_stations(station_df, elem_inv_df, (w, s, e, n),
-                                       None, elements, min_years,
-                                       start_date, end_date, fatal=False)
-            if len(filtered) >= min_stations:
+            filtered, elem_counts = filter_stations(
+                station_df, elem_inv_df, (w, s, e, n),
+                None, elements, min_years, start_date, end_date, fatal=False)
+            if (not filtered.empty and
+                    min(elem_counts.get(el, 0) for el in elements) >= min_stations):
                 break
             expansion += _STEP
             if expansion > _MAX:
                 gs.fatal(
-                    "Could not find {} stations within {:.0f}° of the region "
-                    "(found {}). Loosen min_years or min_stations.".format(
-                        min_stations, _MAX, len(filtered)))
+                    "Could not find {} stations per element within {:.0f}° of "
+                    "the region. Loosen min_years or min_stations.\n"
+                    "Current per-element counts: {}".format(
+                        min_stations, _MAX,
+                        ', '.join('{}={}'.format(e, elem_counts.get(e, 0))
+                                  for e in elements)))
             w -= _STEP; s -= _STEP; e += _STEP; n += _STEP
             gs.message(
-                "  {}/{} stations — expanding bbox by {:.1f}° "
-                "(total expansion: {:.1f}°)".format(
-                    len(filtered), min_stations, _STEP, expansion))
+                "  min_stations={} not met for all elements — expanding by "
+                "{:.1f}° (total: {:.1f}°)".format(min_stations, _STEP, expansion))
         if expansion > 0.0:
             gs.message(
-                "min_stations={} satisfied after {:.1f}° expansion "
-                "({} stations).".format(min_stations, expansion, len(filtered)))
+                "min_stations={} per element satisfied after {:.1f}° expansion "
+                "({} stations total).".format(min_stations, expansion, len(filtered)))
     else:
-        filtered = filter_stations(station_df, elem_inv_df, bbox, station_ids,
-                                   elements, min_years, start_date, end_date)
+        filtered, elem_counts = filter_stations(
+            station_df, elem_inv_df, bbox, station_ids,
+            elements, min_years, start_date, end_date)
+
+    report_temporal_coverage(filtered, elem_inv_df, elements, start_date, end_date)
 
     import geopandas as gpd
     from shapely.geometry import Point
