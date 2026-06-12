@@ -616,6 +616,18 @@ def main():
     if not flag_locations and not end_date:
         end_date = date.today().isoformat()
 
+    if min_years and start_date:
+        _start_yr = int(start_date[:4])
+        _end_yr   = int(end_date[:4]) if end_date else date.today().year
+        _range_yrs = _end_yr - _start_yr + 1
+        if min_years > _range_yrs:
+            gs.fatal(
+                "min_years={} exceeds the requested date range of {} year(s) "
+                "({}-{}): no station can satisfy this filter. "
+                "Lower min_years or widen the date range.".format(
+                    min_years, _range_yrs, _start_yr, _end_yr)
+            )
+
     # Apply fixed padding to bbox
     if bbox and padding > 0.0:
         w, s, e, n = bbox
