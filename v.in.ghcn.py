@@ -437,7 +437,7 @@ def report_temporal_coverage(df, elem_inv_df, elements, start_date, end_date,
 
 
 def inventory_decade_hull_gaps(filtered_df, elem_inv_df, per_element_sids,
-                               centroid_ll, start_date, end_date, granularity=10):
+                               centroid_ll, start_date, end_date, granularity=1):
     """Return per-element inventory hull gaps across temporal periods.
 
     For each period of `granularity` years in [start_date, end_date], checks
@@ -849,7 +849,7 @@ def check_data_decade_hull(cur, table_name, elements, cat_to_xy_ll, centroid_ll,
 
 
 def _hull_criterion(filtered_df, elem_inv_df, per_element_sids,
-                    centroid_ll, start_date, end_date, granularity=10):
+                    centroid_ll, start_date, end_date, granularity=1):
     """Return (ok: bool, inv_gaps: dict) for the appropriate hull check.
 
     Dispatches on whether start_date is given:

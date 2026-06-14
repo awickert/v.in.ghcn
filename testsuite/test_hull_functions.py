@@ -187,10 +187,15 @@ class TestFilterStationsReturnType:
         assert sids["PRCP"] == _surrounding_sids()
 
     def test_min_years_filter_updates_sids(self):
-        """Stations with insufficient record years are excluded from sids."""
+        """min_years filters df and counts but not per_element_sids (hull criterion).
+
+        per_element_sids is independent of min_years: any station with an
+        inventory record in the requested period contributes to hull checks.
+        SID_N (6-year record) is in sids but not counted toward min_stations.
+        """
         station_df = _surrounding_stations()
         elem_inv = _elem_inv(
-            ("SID_N", "PRCP", 2015, 2020),   # 6 years — too short
+            ("SID_N", "PRCP", 2015, 2020),   # 6 years — too short for min_years=10
             ("SID_S", "PRCP", 1950, 2020),
             ("SID_E", "PRCP", 1950, 2020),
             ("SID_W", "PRCP", 1950, 2020),
@@ -206,10 +211,12 @@ class TestFilterStationsReturnType:
             end_date="2020-12-31",
         )
 
-        # SID_N passes the overall filter (has PRCP on inventory) but NOT
-        # min_years, so it is excluded from per_element_sids for PRCP.
-        assert "SID_N" not in sids["PRCP"]
+        # per_element_sids: SID_N has inventory overlap with 1950-2020 → hull-eligible
+        assert "SID_N" in sids["PRCP"]
+        # per_element_counts: SID_N fails min_years=10 → excluded from download count
         assert counts["PRCP"] == 3
+        # df: SID_N not downloaded
+        assert "SID_N" not in set(df["station_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -395,13 +402,14 @@ class TestCheckDataDecadeHull:
         return rows
 
     def test_full_coverage_no_gaps(self):
+        """One record per station in 1960; decade granularity → no gaps."""
         cat_to_xy = self._full_cat_to_xy()
         records   = self._records_for_decade(cat_to_xy, 1960)
         conn, cur, table = self._make_db_with_records(records)
 
         gaps = check_data_decade_hull(
             cur, table, ["PRCP"], cat_to_xy, _centroid(),
-            "1960-01-01", "1969-12-31")
+            "1960-01-01", "1969-12-31", granularity=10)
         conn.close()
         assert gaps == {}
 
@@ -437,6 +445,73 @@ class TestCheckDataDecadeHull:
 
         assert "PRCP" in gaps
         assert 1890 in gaps["PRCP"]
+
+    def test_annual_granularity_catches_within_decade_gap(self):
+        """granularity=1: one record in 1960 does not cover 1961-1969."""
+        cat_to_xy = self._full_cat_to_xy()
+        # Each station has one record in 1960 only
+        records = self._records_for_decade(cat_to_xy, 1960)
+        conn, cur, table = self._make_db_with_records(records)
+
+        gaps = check_data_decade_hull(
+            cur, table, ["PRCP"], cat_to_xy, _centroid(),
+            "1960-01-01", "1969-12-31", granularity=1)
+        conn.close()
+
+        assert "PRCP" in gaps
+        assert 1960 not in gaps["PRCP"], "1960 has data — should not be a gap"
+        assert all(y in gaps["PRCP"] for y in range(1961, 1970)), \
+            "1961-1969 have no records — all should be gaps"
+
+    def test_min_coverage_excludes_sparse_stations(self):
+        """min_coverage=0.1 rejects a station with 1 record in a 365-day year."""
+        cat_to_xy = self._full_cat_to_xy()
+        # Each station has exactly one record in 1960 — well below 10% of 366 days
+        records = self._records_for_decade(cat_to_xy, 1960)
+        conn, cur, table = self._make_db_with_records(records)
+
+        gaps = check_data_decade_hull(
+            cur, table, ["PRCP"], cat_to_xy, _centroid(),
+            "1960-01-01", "1960-12-31", granularity=1, min_coverage=0.1)
+        conn.close()
+
+        assert "PRCP" in gaps, \
+            "Stations with 1/366 coverage (~0.003) should fail min_coverage=0.1"
+
+    def test_min_coverage_passes_sufficient_stations(self):
+        """min_coverage=0.1 accepts stations with ~half-year of daily records."""
+        import datetime
+        cat_to_xy = self._full_cat_to_xy()
+        # Give each station 200 daily records in 1960 (200/366 ≈ 0.55 > 0.1)
+        records = []
+        for cat in cat_to_xy:
+            base = datetime.date(1960, 1, 1)
+            for d in range(200):
+                dt = (base + datetime.timedelta(days=d)).isoformat()
+                records.append((cat, "SID_{}".format(cat), dt, "PRCP", 5.0, None))
+        conn, cur, table = self._make_db_with_records(records)
+
+        gaps = check_data_decade_hull(
+            cur, table, ["PRCP"], cat_to_xy, _centroid(),
+            "1960-01-01", "1960-12-31", granularity=1, min_coverage=0.1)
+        conn.close()
+
+        assert gaps == {}, \
+            "200/366 ≈ 0.55 coverage should satisfy min_coverage=0.1"
+
+    def test_min_coverage_zero_preserves_single_record_behaviour(self):
+        """min_coverage=0 (default): one record per station is sufficient."""
+        cat_to_xy = self._full_cat_to_xy()
+        records = self._records_for_decade(cat_to_xy, 1960)
+        conn, cur, table = self._make_db_with_records(records)
+
+        gaps = check_data_decade_hull(
+            cur, table, ["PRCP"], cat_to_xy, _centroid(),
+            "1960-01-01", "1960-12-31", granularity=1, min_coverage=0.0)
+        conn.close()
+
+        assert gaps == {}, \
+            "min_coverage=0 should accept a single record per station"
 
 
 # ---------------------------------------------------------------------------
@@ -686,7 +761,7 @@ class TestMonthlyPath:
         cur  = conn.cursor()
         gaps = check_data_decade_hull(
             cur, table, ["PRCP"], cat_to_xy, _centroid(),
-            "1960-01-01", "1969-12-31")
+            "1960-01-01", "1969-12-31", granularity=10)
         conn.close()
         assert gaps == {}, "All four surrounding stations have 1960s data — no hull gap"
 
