@@ -715,6 +715,34 @@ def get_sample_centroid_ll(sample_map):
 
 
 
+def basin_inside_hull(filtered_df, per_element_sids, centroid_ll):
+    """Return True if centroid_ll is inside the convex hull of qualifying stations.
+
+    Used when no start_date is given, so there are no meaningful decades to
+    iterate over.  Checks aggregate coverage: stations with sufficient data
+    anywhere in their record (per_element_sids) form a hull around the centroid
+    for every requested element.  Returns False for any element with < 3 stations.
+    """
+    import numpy as np
+    from scipy.spatial import Delaunay
+
+    lon_c, lat_c = centroid_ll
+    pt = np.array([[lon_c, lat_c]])
+
+    for elem, sids in per_element_sids.items():
+        coords = filtered_df[filtered_df['station_id'].isin(sids)][
+            ['longitude', 'latitude']].values.astype(np.float64)
+        if len(coords) < 3:
+            return False
+        try:
+            hull = Delaunay(coords)
+        except Exception:
+            return False
+        if hull.find_simplex(pt)[0] < 0:
+            return False
+    return True
+
+
 def check_data_decade_hull(cur, table_name, elements, cat_to_xy_ll, centroid_ll,
                             start_date, end_date):
     """Check per-decade hull coverage using actual downloaded data in SQLite.
@@ -855,15 +883,24 @@ def main():
                          (not filtered.empty and
                           min(elem_counts.get(el, 0) for el in elements) >= min_stations))
 
-            # Per-decade inventory hull check subsumes the aggregate hull check:
-            # if all decades pass, the aggregate hull trivially passes too.
+            # Hull criterion depends on whether a date range is specified:
+            #   start_date given → per-decade inventory hull (temporal check)
+            #   no start_date    → aggregate hull (basin_inside_hull), because
+            #     inventory_decade_hull_gaps degenerates to a single current-decade
+            #     check when start_date is None, which is not meaningful.
             if centroid_ll and not filtered.empty:
-                inv_gaps = inventory_decade_hull_gaps(
-                    filtered, elem_inv_df, elem_sids,
-                    centroid_ll, start_date, end_date)
+                if start_date:
+                    inv_gaps = inventory_decade_hull_gaps(
+                        filtered, elem_inv_df, elem_sids,
+                        centroid_ll, start_date, end_date)
+                    temporal_hull_ok = not inv_gaps
+                else:
+                    temporal_hull_ok = basin_inside_hull(
+                        filtered, elem_sids, centroid_ll)
+                    inv_gaps = {} if temporal_hull_ok else {'_': ['aggregate hull']}
             else:
-                inv_gaps = {} if (not centroid_ll) else {'_': ['no stations']}
-            temporal_hull_ok = not inv_gaps
+                inv_gaps = {}
+                temporal_hull_ok = not centroid_ll or filtered.empty
 
             if counts_ok and temporal_hull_ok:
                 break
@@ -896,10 +933,13 @@ def main():
             if not counts_ok:
                 reasons.append("min_stations={} not met".format(min_stations))
             if not temporal_hull_ok:
-                bad_summary = ', '.join(
-                    '{} {}'.format(el, _year_ranges(bad))
-                    for el, bad in sorted(inv_gaps.items()))
-                reasons.append("inventory hull gap: {}".format(bad_summary))
+                if start_date:
+                    bad_summary = ', '.join(
+                        '{} {}'.format(el, _year_ranges(bad))
+                        for el, bad in sorted(inv_gaps.items()))
+                    reasons.append("inventory hull gap: {}".format(bad_summary))
+                else:
+                    reasons.append("basin outside aggregate station hull")
             gs.message(
                 "  Pass 1: {} — expanding by {:.1f}° (total: {:.1f}°, step {:d})".format(
                     ', '.join(reasons), _STEP, expansion, iterations))
@@ -912,7 +952,7 @@ def main():
         filtered, elem_counts, elem_sids = filter_stations(
             station_df, elem_inv_df, bbox, station_ids,
             elements, min_years, start_date, end_date)
-        if centroid_ll and not filtered.empty:
+        if centroid_ll and not filtered.empty and start_date:
             inv_gaps = inventory_decade_hull_gaps(
                 filtered, elem_inv_df, elem_sids,
                 centroid_ll, start_date, end_date)
