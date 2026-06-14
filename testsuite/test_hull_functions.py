@@ -605,3 +605,112 @@ class TestAppendBehavior:
         ).fetchone()[0]
         conn.close()
         assert val == pytest.approx(10.0), "100 tenths-mm should convert to 10.0 mm"
+
+
+# ---------------------------------------------------------------------------
+# Monthly path: data storage and decade hull check  (item 6 verification)
+# ---------------------------------------------------------------------------
+
+def _make_ghcnm_csv_text(station_id, records):
+    """Synthetic GHCNm per-station CSV text (not gzip-compressed; uses r.text).
+
+    records: list of (yyyymm_int, value_tenths_mm).
+    Columns: ID, NAME, LAT, LON, ELEV, YYYYMM, VALUE, DM_FLAG, QC_FLAG, DS_FLAG
+    """
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    for yyyymm, val in records:
+        w.writerow([station_id, "TEST STATION", 44.0, -93.0, 300.0,
+                    yyyymm, val, "", "", "S"])
+    return buf.getvalue()
+
+
+class TestMonthlyPath:
+    """Monthly frequency: data stored as YYYY-MM-01; decade hull check works.
+
+    Item 6 verification: both Pass 1 (_hull_criterion) and Pass 2
+    (check_data_decade_hull) operate on frequency-agnostic logic; the monthly
+    fetch dispatches correctly throughout.  These tests lock in that behaviour.
+    """
+
+    def _run_monthly_fetch(self, tmp_path, station_id, cat, csv_text, table,
+                           append=False):
+        mock_resp = MagicMock()
+        mock_resp.text = csv_text
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = lambda: None
+
+        with patch.object(_mod, 'get_mapset_db',
+                          return_value=str(tmp_path / 'test.db')):
+            with patch('requests.get', return_value=mock_resp):
+                _mod.fetch_and_write_monthly_timeseries(
+                    [station_id], {station_id: cat},
+                    "1960-01-01", "1969-12-31", "strict", table,
+                    append=append)
+
+    def test_monthly_datetime_stored_as_first_of_month(self, tmp_path):
+        """Monthly records are stored as YYYY-MM-01."""
+        table = "ghcn_mo"
+        csv_text = _make_ghcnm_csv_text("SID_A", [(196006, 1200)])
+        self._run_monthly_fetch(tmp_path, "SID_A", 1, csv_text, table)
+
+        conn = sqlite3.connect(str(tmp_path / "test.db"))
+        rows = conn.execute(
+            'SELECT datetime, value FROM "{}"'.format(table)).fetchall()
+        conn.close()
+        assert len(rows) == 1
+        assert rows[0][0] == "1960-06-01"
+        assert rows[0][1] == pytest.approx(120.0)   # 1200 tenths-mm → 120 mm
+
+    def test_check_data_decade_hull_finds_monthly_records(self, tmp_path):
+        """check_data_decade_hull locates monthly PRCP records by decade.
+
+        Monthly datetimes (YYYY-MM-01) fall within decade range queries
+        (YYYY-01-01 to YYYY-12-31), so the same hull-check logic works
+        for both daily and monthly storage.
+        """
+        table = "ghcn_mo"
+        cat_to_xy = {
+            1: (-90.0, 44.0),   # SID_1 — east
+            2: (-93.0, 46.0),   # SID_2 — north
+            3: (-93.0, 42.0),   # SID_3 — south
+            4: (-96.0, 44.0),   # SID_4 — west
+        }
+        for cat, (lon, lat) in sorted(cat_to_xy.items()):
+            sid = "SID_{}".format(cat)
+            csv_text = _make_ghcnm_csv_text(sid, [(196006, 1200)])
+            self._run_monthly_fetch(tmp_path, sid, cat, csv_text, table,
+                                    append=(cat > 1))
+
+        conn = sqlite3.connect(str(tmp_path / "test.db"))
+        cur  = conn.cursor()
+        gaps = check_data_decade_hull(
+            cur, table, ["PRCP"], cat_to_xy, _centroid(),
+            "1960-01-01", "1969-12-31")
+        conn.close()
+        assert gaps == {}, "All four surrounding stations have 1960s data — no hull gap"
+
+    def test_missing_monthly_decade_flagged(self, tmp_path):
+        """Hull gap correctly reported when monthly data absent from a decade."""
+        table = "ghcn_mo"
+        cat_to_xy = {
+            1: (-90.0, 44.0),
+            2: (-93.0, 46.0),
+            3: (-93.0, 42.0),
+            4: (-96.0, 44.0),
+        }
+        # Only 1950s monthly data — no 1960s records
+        for cat, _ in sorted(cat_to_xy.items()):
+            sid = "SID_{}".format(cat)
+            csv_text = _make_ghcnm_csv_text(sid, [(195006, 1200)])
+            self._run_monthly_fetch(tmp_path, sid, cat, csv_text, table,
+                                    append=(cat > 1))
+
+        conn = sqlite3.connect(str(tmp_path / "test.db"))
+        cur  = conn.cursor()
+        gaps = check_data_decade_hull(
+            cur, table, ["PRCP"], cat_to_xy, _centroid(),
+            "1960-01-01", "1969-12-31")
+        conn.close()
+        assert "PRCP" in gaps
+        assert 1960 in gaps["PRCP"]
