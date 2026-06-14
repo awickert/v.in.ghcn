@@ -116,6 +116,15 @@
 #%end
 
 #%option
+#%  key: granularity
+#%  type: integer
+#%  label: Temporal granularity (years) for per-period hull coverage checks
+#%  description: Hull enclosure is verified in non-overlapping periods of this length across the requested date range
+#%  answer: 10
+#%  required: no
+#%end
+
+#%option
 #%  key: q_flags
 #%  type: string
 #%  label: Quality flag filter
@@ -401,19 +410,20 @@ def report_temporal_coverage(df, elem_inv_df, elements, start_date, end_date,
 
 
 def inventory_decade_hull_gaps(filtered_df, elem_inv_df, per_element_sids,
-                               centroid_ll, start_date, end_date):
-    """Return per-element inventory hull gaps across decades.
+                               centroid_ll, start_date, end_date, granularity=10):
+    """Return per-element inventory hull gaps across temporal periods.
 
-    For each decade in [start_date, end_date], checks whether the basin centroid
-    falls inside the convex hull of stations that (a) passed per-element min_years
-    filtering (per_element_sids) and (b) have inventory overlap with that decade
-    (firstyear <= dec+9 AND lastyear >= dec).
+    For each period of `granularity` years in [start_date, end_date], checks
+    whether the basin centroid falls inside the convex hull of stations that
+    (a) passed per-element min_years filtering (per_element_sids) and (b) have
+    inventory overlap with that period
+    (firstyear <= period+granularity-1 AND lastyear >= period).
 
-    Returns dict: element -> list of decade-start years where hull fails.
+    Returns dict: element -> list of period-start years where hull fails.
     Empty dict means full inventory-level temporal coverage.
 
     Used as a Pass 1 expansion criterion so the bbox is enlarged until the
-    inventory predicts surrounding coverage in every decade, before any data
+    inventory predicts surrounding coverage in every period, before any data
     is downloaded.
     """
     import numpy as np
@@ -425,7 +435,8 @@ def inventory_decade_hull_gaps(filtered_df, elem_inv_df, per_element_sids,
     lon_c, lat_c = centroid_ll
     pt = np.array([[lon_c, lat_c]])
 
-    decade_starts = list(range((start_yr // 10) * 10, end_yr + 1, 10))
+    period_starts = list(range((start_yr // granularity) * granularity,
+                               end_yr + 1, granularity))
     gaps = {}
 
     for elem, sids in per_element_sids.items():
@@ -434,25 +445,25 @@ def inventory_decade_hull_gaps(filtered_df, elem_inv_df, per_element_sids,
             (elem_inv_df['station_id'].isin(sids))
         ]
         elem_gaps = []
-        for dec in decade_starts:
+        for period in period_starts:
             active = ef_elem[
-                (ef_elem['firstyear'] <= dec + 9) &
-                (ef_elem['lastyear']  >= dec)
+                (ef_elem['firstyear'] <= period + granularity - 1) &
+                (ef_elem['lastyear']  >= period)
             ]
             coords = filtered_df[
                 filtered_df['station_id'].isin(set(active['station_id']))
             ][['longitude', 'latitude']].values.astype(np.float64)
 
             if len(coords) < 3:
-                elem_gaps.append(dec)
+                elem_gaps.append(period)
                 continue
             try:
                 hull = Delaunay(coords)
             except Exception:
-                elem_gaps.append(dec)
+                elem_gaps.append(period)
                 continue
             if hull.find_simplex(pt)[0] < 0:
-                elem_gaps.append(dec)
+                elem_gaps.append(period)
 
         if elem_gaps:
             gaps[elem] = elem_gaps
@@ -463,13 +474,13 @@ def inventory_decade_hull_gaps(filtered_df, elem_inv_df, per_element_sids,
 def report_inventory_hull_gaps(gaps):
     """Print inventory hull gap dict returned by inventory_decade_hull_gaps()."""
     if not gaps:
-        gs.message("Inventory temporal hull: basin enclosed in all decades.")
+        gs.message("Inventory temporal hull: basin enclosed in all periods.")
         return
-    for elem, bad_decades in sorted(gaps.items()):
+    for elem, bad_periods in sorted(gaps.items()):
         gs.warning(
             "Inventory hull gap — {}: basin centroid outside active-station hull "
-            "for decade(s) starting: {}. Spatial interpolation may extrapolate "
-            "for these periods.".format(elem, _year_ranges(bad_decades)))
+            "for period(s) starting: {}. Spatial interpolation may extrapolate "
+            "for these periods.".format(elem, _year_ranges(bad_periods)))
 
 
 def get_mapset_db():
@@ -733,14 +744,14 @@ def basin_inside_hull(filtered_df, per_element_sids, centroid_ll):
 
 
 def check_data_decade_hull(cur, table_name, elements, cat_to_xy_ll, centroid_ll,
-                            start_date, end_date):
-    """Check per-decade hull coverage using actual downloaded data in SQLite.
+                            start_date, end_date, granularity=10):
+    """Check per-period hull coverage using actual downloaded data in SQLite.
 
-    For each decade in [start_date, end_date], queries which cats have records
-    for each element in that decade, builds a convex hull from their lon/lat
-    coordinates, and tests containment of centroid_ll.
+    For each period of `granularity` years in [start_date, end_date], queries
+    which cats have records for each element in that period, builds a convex
+    hull from their lon/lat coordinates, and tests containment of centroid_ll.
 
-    Returns dict: element -> list of decade-start years where hull fails.
+    Returns dict: element -> list of period-start years where hull fails.
     Empty dict means full coverage.
     """
     import numpy as np
@@ -748,7 +759,8 @@ def check_data_decade_hull(cur, table_name, elements, cat_to_xy_ll, centroid_ll,
 
     end_yr   = int(end_date[:4]) if end_date   else date.today().year
     start_yr = int(start_date[:4]) if start_date else end_yr
-    decade_starts = list(range((start_yr // 10) * 10, end_yr + 1, 10))
+    period_starts = list(range((start_yr // granularity) * granularity,
+                               end_yr + 1, granularity))
 
     lon_c, lat_c = centroid_ll
     pt = np.array([[lon_c, lat_c]])
@@ -756,42 +768,42 @@ def check_data_decade_hull(cur, table_name, elements, cat_to_xy_ll, centroid_ll,
     gaps = {}
     for elem in elements:
         elem_gaps = []
-        for dec in decade_starts:
+        for period in period_starts:
             cur.execute(
                 'SELECT DISTINCT cat FROM "{}" WHERE element=? '
                 'AND datetime >= ? AND datetime <= ?'.format(table_name),
                 (elem,
-                 '{:04d}-01-01'.format(dec),
-                 '{:04d}-12-31'.format(dec + 9))
+                 '{:04d}-01-01'.format(period),
+                 '{:04d}-12-31'.format(period + granularity - 1))
             )
             active_cats = {row[0] for row in cur.fetchall()}
             coords = np.array([cat_to_xy_ll[c] for c in active_cats
                                 if c in cat_to_xy_ll], dtype=np.float64)
             if len(coords) < 3:
-                elem_gaps.append(dec)
+                elem_gaps.append(period)
                 continue
             try:
                 hull = Delaunay(coords)
             except Exception:
-                elem_gaps.append(dec)
+                elem_gaps.append(period)
                 continue
             if hull.find_simplex(pt)[0] < 0:
-                elem_gaps.append(dec)
+                elem_gaps.append(period)
         if elem_gaps:
             gaps[elem] = elem_gaps
     return gaps
 
 
 def _hull_criterion(filtered_df, elem_inv_df, per_element_sids,
-                    centroid_ll, start_date, end_date):
+                    centroid_ll, start_date, end_date, granularity=10):
     """Return (ok: bool, inv_gaps: dict) for the appropriate hull check.
 
     Dispatches on whether start_date is given:
-      start_date set  → per-decade inventory hull via inventory_decade_hull_gaps()
+      start_date set  → per-period inventory hull via inventory_decade_hull_gaps()
       start_date None → aggregate hull via basin_inside_hull()
 
     inventory_decade_hull_gaps() degenerates when start_date is absent (it
-    only checks the current decade), so the aggregate check is used instead.
+    only checks the current period), so the aggregate check is used instead.
 
     Returns (True, {}) when centroid_ll is None or filtered_df is empty.
     """
@@ -800,7 +812,7 @@ def _hull_criterion(filtered_df, elem_inv_df, per_element_sids,
     if start_date:
         gaps = inventory_decade_hull_gaps(
             filtered_df, elem_inv_df, per_element_sids,
-            centroid_ll, start_date, end_date)
+            centroid_ll, start_date, end_date, granularity=granularity)
         return not gaps, gaps
     else:
         ok = basin_inside_hull(filtered_df, per_element_sids, centroid_ll)
@@ -823,6 +835,7 @@ def main():
     sample_map     = options['domain']              if options['domain']         else None
     max_distance   = float(options['max_distance']) if options['max_distance']   else 10.0
     max_iterations = int(options['max_iterations']) if options['max_iterations'] else 40
+    granularity    = int(options['granularity'])    if options['granularity']    else 10
     q_flags        = options['q_flags']
     flag_locations = flags['l']
 
@@ -899,7 +912,8 @@ def main():
                           min(elem_counts.get(el, 0) for el in elements) >= min_stations))
 
             temporal_hull_ok, inv_gaps = _hull_criterion(
-                filtered, elem_inv_df, elem_sids, centroid_ll, start_date, end_date)
+                filtered, elem_inv_df, elem_sids, centroid_ll, start_date, end_date,
+                granularity=granularity)
 
             if counts_ok and temporal_hull_ok:
                 break
@@ -952,7 +966,8 @@ def main():
             station_df, elem_inv_df, bbox, station_ids,
             elements, min_years, start_date, end_date)
         _, inv_gaps = _hull_criterion(
-            filtered, elem_inv_df, elem_sids, centroid_ll, start_date, end_date)
+            filtered, elem_inv_df, elem_sids, centroid_ll, start_date, end_date,
+            granularity=granularity)
 
     report_temporal_coverage(filtered, elem_inv_df, elements, start_date, end_date)
 
@@ -1016,7 +1031,7 @@ def main():
         while True:
             gaps = check_data_decade_hull(
                 cur2, table_name, elements, cat_to_xy_ll,
-                centroid_ll, start_date, end_date)
+                centroid_ll, start_date, end_date, granularity=granularity)
             if not gaps:
                 gs.message("Pass 2: data-based hull check passed.")
                 break
