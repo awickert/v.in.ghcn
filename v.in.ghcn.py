@@ -94,7 +94,7 @@
 #%end
 
 #%option G_OPT_V_INPUT
-#%  key: sample
+#%  key: domain
 #%  label: Domain polygon; bbox is expanded until stations enclose the polygon (inventory check), then verified against downloaded data
 #%  required: no
 #%end
@@ -804,7 +804,7 @@ def main():
     min_years      = int(options['min_years'])      if options['min_years']      else None
     padding        = float(options['padding'])      if options['padding']        else 0.0
     min_stations   = int(options['min_stations'])   if options['min_stations']   else None
-    sample_map     = options['sample']              if options['sample']         else None
+    sample_map     = options['domain']              if options['domain']         else None
     max_distance   = float(options['max_distance']) if options['max_distance']   else 10.0
     max_iterations = int(options['max_iterations']) if options['max_iterations'] else 40
     q_flags        = options['q_flags']
