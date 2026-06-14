@@ -89,13 +89,29 @@
 #%option
 #%  key: min_stations
 #%  type: integer
-#%  label: Minimum number of stations; bbox is expanded by 0.5 degrees per step until satisfied
+#%  label: Minimum number of stations; bbox is expanded until satisfied
 #%  required: no
 #%end
 
 #%option G_OPT_V_INPUT
 #%  key: sample
-#%  label: Basin polygon map; bbox is expanded until the basin falls inside the station convex hull for each element
+#%  label: Domain polygon; bbox is expanded until stations enclose the polygon (inventory check), then verified against downloaded data
+#%  required: no
+#%end
+
+#%option
+#%  key: max_distance
+#%  type: double
+#%  label: Maximum bbox expansion in each direction (degrees); shared across inventory and data passes
+#%  answer: 10.0
+#%  required: no
+#%end
+
+#%option
+#%  key: max_iterations
+#%  type: integer
+#%  label: Maximum number of expansion steps (each 0.5 degrees); shared across inventory and data passes
+#%  answer: 40
 #%  required: no
 #%end
 
@@ -259,7 +275,7 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
         ].copy()
         if df.empty:
             if not fatal:
-                return df, {}
+                return df, {}, {}
             gs.fatal("No stations found within the current region.")
 
     # Keep only stations that have at least one requested element on record
@@ -463,36 +479,45 @@ def get_cat_map(output):
     return cat_map
 
 
-def fetch_and_write_timeseries(station_ids, cat_map, elements, start_date, end_date,
-                               q_flags, table_name):
-    """Download per-station GHCNd CSVs and write records to mapset SQLite database."""
-    import requests
-
+def get_mapset_db():
+    """Return path to the current mapset's SQLite database, creating the directory if needed."""
     gisenv = gs.gisenv()
     db_dir = os.path.join(
         gisenv['GISDBASE'], gisenv['LOCATION_NAME'], gisenv['MAPSET'], 'sqlite'
     )
     os.makedirs(db_dir, exist_ok=True)
-    db_path = os.path.join(db_dir, 'sqlite.db')
+    return os.path.join(db_dir, 'sqlite.db')
 
+
+def fetch_and_write_timeseries(station_ids, cat_map, elements, start_date, end_date,
+                               q_flags, table_name, append=False):
+    """Download per-station GHCNd CSVs and write records to mapset SQLite database.
+
+    When append=True the existing table is kept and new rows are inserted.
+    When append=False (default) the table is dropped and recreated first.
+    """
+    import requests
+
+    db_path = get_mapset_db()
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute('DROP TABLE IF EXISTS "{}"'.format(table_name))
-    cur.execute('''
-        CREATE TABLE "{}" (
-            cat        INTEGER,
-            station_id TEXT,
-            datetime   TEXT,
-            element    TEXT,
-            value      REAL,
-            q_flag     TEXT
+    if not append:
+        cur.execute('DROP TABLE IF EXISTS "{}"'.format(table_name))
+        cur.execute('''
+            CREATE TABLE "{}" (
+                cat        INTEGER,
+                station_id TEXT,
+                datetime   TEXT,
+                element    TEXT,
+                value      REAL,
+                q_flag     TEXT
+            )
+        '''.format(table_name))
+        cur.execute(
+            'CREATE INDEX "{}_idx" ON "{}" (cat, element, datetime)'.format(
+                table_name, table_name)
         )
-    '''.format(table_name))
-    cur.execute(
-        'CREATE INDEX "{}_idx" ON "{}" (cat, element, datetime)'.format(
-            table_name, table_name)
-    )
-    conn.commit()
+        conn.commit()
 
     total_rows = 0
     for station_id in station_ids:
@@ -555,35 +580,34 @@ def fetch_and_write_timeseries(station_ids, cat_map, elements, start_date, end_d
 
 
 def fetch_and_write_monthly_timeseries(station_ids, cat_map, start_date, end_date,
-                                       q_flags, table_name):
-    """Download per-station GHCNm precipitation CSVs and write to mapset SQLite."""
+                                       q_flags, table_name, append=False):
+    """Download per-station GHCNm precipitation CSVs and write to mapset SQLite.
+
+    When append=True the existing table is kept and new rows are inserted.
+    When append=False (default) the table is dropped and recreated first.
+    """
     import requests
 
-    gisenv = gs.gisenv()
-    db_dir = os.path.join(
-        gisenv['GISDBASE'], gisenv['LOCATION_NAME'], gisenv['MAPSET'], 'sqlite'
-    )
-    os.makedirs(db_dir, exist_ok=True)
-    db_path = os.path.join(db_dir, 'sqlite.db')
-
+    db_path = get_mapset_db()
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute('DROP TABLE IF EXISTS "{}"'.format(table_name))
-    cur.execute('''
-        CREATE TABLE "{}" (
-            cat        INTEGER,
-            station_id TEXT,
-            datetime   TEXT,
-            element    TEXT,
-            value      REAL,
-            q_flag     TEXT
+    if not append:
+        cur.execute('DROP TABLE IF EXISTS "{}"'.format(table_name))
+        cur.execute('''
+            CREATE TABLE "{}" (
+                cat        INTEGER,
+                station_id TEXT,
+                datetime   TEXT,
+                element    TEXT,
+                value      REAL,
+                q_flag     TEXT
+            )
+        '''.format(table_name))
+        cur.execute(
+            'CREATE INDEX "{}_idx" ON "{}" (cat, element, datetime)'.format(
+                table_name, table_name)
         )
-    '''.format(table_name))
-    cur.execute(
-        'CREATE INDEX "{}_idx" ON "{}" (cat, element, datetime)'.format(
-            table_name, table_name)
-    )
-    conn.commit()
+        conn.commit()
 
     # Convert YYYY-MM-DD date bounds to integer YYYYMM for fast comparison
     start_ym = int(start_date[:4] + start_date[5:7]) if start_date else None
@@ -717,6 +741,56 @@ def basin_inside_hull(filtered_df, per_element_sids, centroid_ll):
     return True
 
 
+def check_data_decade_hull(cur, table_name, elements, cat_to_xy_ll, centroid_ll,
+                            start_date, end_date):
+    """Check per-decade hull coverage using actual downloaded data in SQLite.
+
+    For each decade in [start_date, end_date], queries which cats have records
+    for each element in that decade, builds a convex hull from their lon/lat
+    coordinates, and tests containment of centroid_ll.
+
+    Returns dict: element -> list of decade-start years where hull fails.
+    Empty dict means full coverage.
+    """
+    import numpy as np
+    from scipy.spatial import Delaunay
+
+    end_yr   = int(end_date[:4]) if end_date   else date.today().year
+    start_yr = int(start_date[:4]) if start_date else end_yr
+    decade_starts = list(range((start_yr // 10) * 10, end_yr + 1, 10))
+
+    lon_c, lat_c = centroid_ll
+    pt = np.array([[lon_c, lat_c]])
+
+    gaps = {}
+    for elem in elements:
+        elem_gaps = []
+        for dec in decade_starts:
+            cur.execute(
+                'SELECT DISTINCT cat FROM "{}" WHERE element=? '
+                'AND datetime >= ? AND datetime <= ?'.format(table_name),
+                (elem,
+                 '{:04d}-01-01'.format(dec),
+                 '{:04d}-12-31'.format(dec + 9))
+            )
+            active_cats = {row[0] for row in cur.fetchall()}
+            coords = np.array([cat_to_xy_ll[c] for c in active_cats
+                                if c in cat_to_xy_ll], dtype=np.float64)
+            if len(coords) < 3:
+                elem_gaps.append(dec)
+                continue
+            try:
+                hull = Delaunay(coords)
+            except Exception:
+                elem_gaps.append(dec)
+                continue
+            if hull.find_simplex(pt)[0] < 0:
+                elem_gaps.append(dec)
+        if elem_gaps:
+            gaps[elem] = elem_gaps
+    return gaps
+
+
 def main():
     options, flags = gs.parser()
     atexit.register(cleanup)
@@ -727,11 +801,13 @@ def main():
     elements_str = options['elements']
     start_date = options['start_date'] or None
     end_date = options['end_date'] or None
-    min_years     = int(options['min_years'])     if options['min_years']     else None
-    padding       = float(options['padding'])     if options['padding']       else 0.0
-    min_stations  = int(options['min_stations'])  if options['min_stations']  else None
-    sample_map    = options['sample']             if options['sample']        else None
-    q_flags       = options['q_flags']
+    min_years      = int(options['min_years'])      if options['min_years']      else None
+    padding        = float(options['padding'])      if options['padding']        else 0.0
+    min_stations   = int(options['min_stations'])   if options['min_stations']   else None
+    sample_map     = options['sample']              if options['sample']         else None
+    max_distance   = float(options['max_distance']) if options['max_distance']   else 10.0
+    max_iterations = int(options['max_iterations']) if options['max_iterations'] else 40
+    q_flags        = options['q_flags']
     flag_locations = flags['l']
 
     if frequency == 'monthly':
@@ -784,17 +860,16 @@ def main():
         require_package('scipy')
         gs.message("Basin centroid for hull check: lon={:.4f} lat={:.4f}".format(*centroid_ll))
 
-    # Adaptive expansion: grow bbox by 0.5° per step until BOTH criteria are met
-    # for each element independently:
-    #   (a) min_stations threshold, if specified
-    #   (b) basin centroid lies inside the station convex hull, if sample= given
-    # Either criterion alone is sufficient to trigger expansion; both must pass to stop.
+    # ── Pass 1: inventory-based expansion ─────────────────────────────────────
+    # Expand bbox until min_stations and/or inventory hull criteria are met,
+    # subject to shared max_distance / max_iterations budget.
+    _STEP = 0.5   # degrees per expansion step
     need_expansion = (min_stations or centroid_ll) and not station_ids
+    w, s, e, n = bbox if bbox else (None, None, None, None)
+    expansion  = 0.0
+    iterations = 0
+
     if need_expansion:
-        _STEP = 0.5   # degrees per expansion step
-        _MAX  = 10.0  # maximum total expansion in each direction
-        w, s, e, n = bbox
-        expansion = 0.0
         while True:
             filtered, elem_counts, elem_sids = filter_stations(
                 station_df, elem_inv_df, (w, s, e, n),
@@ -810,8 +885,7 @@ def main():
             if counts_ok and hull_ok:
                 break
 
-            expansion += _STEP
-            if expansion > _MAX:
+            if expansion >= max_distance or iterations >= max_iterations:
                 reasons = []
                 if not counts_ok:
                     reasons.append("min_stations={} not met ({})".format(
@@ -821,24 +895,26 @@ def main():
                 if not hull_ok:
                     reasons.append("basin centroid outside station hull for ≥1 element")
                 gs.fatal(
-                    "Could not satisfy station criteria within {:.0f}° of the region:\n"
-                    "  {}\nLoosen min_years, min_stations, or check station availability.".format(
-                        _MAX, '\n  '.join(reasons)))
+                    "Could not satisfy station criteria within {:.1f}° / {:d} steps:\n"
+                    "  {}\nRaise max_distance/max_iterations or loosen filters.".format(
+                        max_distance, max_iterations, '\n  '.join(reasons)))
 
             w -= _STEP; s -= _STEP; e += _STEP; n += _STEP
+            expansion  += _STEP
+            iterations += 1
             reasons = []
             if not counts_ok:
                 reasons.append("min_stations={} not met".format(min_stations))
             if not hull_ok:
                 reasons.append("basin outside hull")
             gs.message(
-                "  {} — expanding by {:.1f}° (total: {:.1f}°)".format(
-                    ', '.join(reasons), _STEP, expansion))
+                "  Pass 1: {} — expanding by {:.1f}° (total: {:.1f}°, step {:d})".format(
+                    ', '.join(reasons), _STEP, expansion, iterations))
 
         if expansion > 0.0:
             gs.message(
-                "Station criteria satisfied after {:.1f}° expansion "
-                "({} stations total).".format(expansion, len(filtered)))
+                "Pass 1 criteria satisfied after {:.1f}° / {:d} step(s) "
+                "({} stations).".format(expansion, iterations, len(filtered)))
     else:
         filtered, elem_counts, elem_sids = filter_stations(
             station_df, elem_inv_df, bbox, station_ids,
@@ -850,37 +926,145 @@ def main():
         report_temporal_hull_coverage(
             filtered, elem_inv_df, elem_sids, centroid_ll, start_date, end_date)
 
+    if flag_locations:
+        # Write vector and return without downloading time series.
+        import geopandas as gpd
+        from shapely.geometry import Point
+        gdf = gpd.GeoDataFrame(
+            filtered,
+            geometry=[Point(lon, lat)
+                      for lon, lat in zip(filtered['longitude'], filtered['latitude'])],
+            crs='EPSG:4326')
+        geodataframe_to_grass(gdf, output)
+        gs.message("Station locations imported to '{}'.".format(output))
+        return
+
+    # ── Pre-assign cats before downloading so Pass 2 can add stations ──────────
+    # Cats are assigned in alphabetical station_id order and held in memory until
+    # the vector map is written after Pass 2.  This decouples cat assignment from
+    # the vector write so new stations can be appended without re-importing.
+    import pandas as pd
+
+    def build_cat_map(df):
+        """Assign cat 1..N in sorted station_id order; return sid->cat dict."""
+        return {sid: i + 1
+                for i, sid in enumerate(sorted(df['station_id'].tolist()))}
+
+    cat_map = build_cat_map(filtered)
+    # lon/lat coords keyed by cat, for data-based hull checks
+    cat_to_xy_ll = {cat_map[row['station_id']]: (row['longitude'], row['latitude'])
+                    for _, row in filtered.iterrows()}
+
+    table_name = '{}_timeseries'.format(output)
+
+    # ── Download data for Pass 1 stations ──────────────────────────────────────
+    downloaded_sids = set(filtered['station_id'])
+    gs.message("Pass 1: fetching time series for {:d} station(s)...".format(
+        len(downloaded_sids)))
+    if frequency == 'monthly':
+        total_rows = fetch_and_write_monthly_timeseries(
+            sorted(downloaded_sids), cat_map, start_date, end_date,
+            q_flags, table_name)
+    else:
+        total_rows = fetch_and_write_timeseries(
+            sorted(downloaded_sids), cat_map, set(elements),
+            start_date, end_date, q_flags, table_name)
+
+    # ── Pass 2: data-based expansion ───────────────────────────────────────────
+    # Now that actual records are in SQLite, check per-decade hull coverage and
+    # expand to fetch additional stations if gaps remain and budget allows.
+    if centroid_ll and need_expansion and not station_ids:
+        require_package('scipy')
+        db_path = get_mapset_db()
+        conn2 = sqlite3.connect(db_path)
+        cur2  = conn2.cursor()
+
+        pass2_iter = 0
+        while True:
+            gaps = check_data_decade_hull(
+                cur2, table_name, elements, cat_to_xy_ll,
+                centroid_ll, start_date, end_date)
+            if not gaps:
+                gs.message("Pass 2: data-based hull check passed.")
+                break
+
+            if expansion >= max_distance or iterations >= max_iterations:
+                for elem, bad in sorted(gaps.items()):
+                    gs.warning(
+                        "Pass 2: {}: data hull gap in decades {} — "
+                        "budget exhausted (max_distance={:.1f}°, "
+                        "max_iterations={:d}).".format(
+                            elem, _year_ranges(bad),
+                            max_distance, max_iterations))
+                break
+
+            w -= _STEP; s -= _STEP; e += _STEP; n += _STEP
+            expansion  += _STEP
+            iterations += 1
+            pass2_iter += 1
+
+            # Find stations in expanded bbox not yet downloaded
+            expanded_all, _, _ = filter_stations(
+                station_df, elem_inv_df, (w, s, e, n),
+                None, elements, min_years, start_date, end_date, fatal=False)
+            new_stations = expanded_all[
+                ~expanded_all['station_id'].isin(downloaded_sids)]
+
+            if new_stations.empty:
+                gs.message(
+                    "  Pass 2 step {:d}: no new stations in expanded bbox "
+                    "({:.1f}° total); stopping.".format(pass2_iter, expansion))
+                break
+
+            # Assign cats to new stations continuing from current max
+            next_cat = max(cat_map.values()) + 1
+            new_map  = {sid: next_cat + i
+                        for i, sid in enumerate(sorted(new_stations['station_id']))}
+            cat_map.update(new_map)
+            for _, row in new_stations.iterrows():
+                cat_to_xy_ll[cat_map[row['station_id']]] = (
+                    row['longitude'], row['latitude'])
+
+            new_sids = sorted(new_stations['station_id'])
+            gs.message(
+                "  Pass 2 step {:d}: expanding {:.1f}° — downloading "
+                "{:d} new station(s).".format(pass2_iter, expansion, len(new_sids)))
+
+            if frequency == 'monthly':
+                total_rows += fetch_and_write_monthly_timeseries(
+                    new_sids, cat_map, start_date, end_date, q_flags, table_name,
+                    append=True)
+            else:
+                total_rows += fetch_and_write_timeseries(
+                    new_sids, cat_map, set(elements),
+                    start_date, end_date, q_flags, table_name, append=True)
+
+            downloaded_sids.update(new_sids)
+            filtered = pd.concat(
+                [filtered, new_stations], ignore_index=True)
+
+        conn2.close()
+
+    # ── Write vector map (once, after all expansion) ───────────────────────────
     import geopandas as gpd
     from shapely.geometry import Point
 
+    # Sort to match cat assignment order (alphabetical station_id)
+    filtered_sorted = filtered.sort_values('station_id').reset_index(drop=True)
     geometry = [Point(lon, lat)
-                for lon, lat in zip(filtered['longitude'], filtered['latitude'])]
-    gdf = gpd.GeoDataFrame(filtered, geometry=geometry, crs='EPSG:4326')
+                for lon, lat in zip(filtered_sorted['longitude'],
+                                    filtered_sorted['latitude'])]
+    gdf = gpd.GeoDataFrame(filtered_sorted, geometry=geometry, crs='EPSG:4326')
     geodataframe_to_grass(gdf, output)
-    gs.message("Station locations imported to '{}'.".format(output))
+    gs.message("Station locations imported to '{}' ({:d} stations).".format(
+        output, len(filtered_sorted)))
 
-    if flag_locations:
-        return
-
-    cat_map = get_cat_map(output)
-    ids = filtered['station_id'].tolist()
-
-    table_name = '{}_timeseries'.format(output)
-    gs.message("Fetching time series for {} station(s)...".format(len(ids)))
-
-    if frequency == 'monthly':
-        total = fetch_and_write_monthly_timeseries(
-            ids, cat_map, start_date, end_date, q_flags, table_name
-        )
-    else:
-        total = fetch_and_write_timeseries(
-            ids, cat_map, set(elements), start_date, end_date, q_flags, table_name
-        )
-
-    gs.message("Time series stored: table '{}', {:,} records.".format(table_name, total))
-    gs.message("Query example:")
-    gs.message("  db.select sql=\"SELECT datetime, value FROM {t} WHERE cat=1 AND element='PRCP' LIMIT 10\"".format(
-        t=table_name))
+    gs.message("Time series stored: table '{}', {:,} records.".format(
+        table_name, total_rows))
+    gs.message(
+        "Query example:\n"
+        "  db.select sql=\"SELECT datetime, value FROM {t} "
+        "WHERE cat=1 AND element='PRCP' LIMIT 10\"".format(t=table_name))
 
 
 if __name__ == '__main__':
