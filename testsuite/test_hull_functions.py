@@ -7,19 +7,25 @@ before the module is imported so that gs.message / gs.fatal / etc. are stubs.
 
 Targeted regressions:
   - filter_stations() must return a 3-tuple even on the fatal=False empty path
-  - basin_inside_hull() used for no-start_date case; inventory_decade_hull_gaps()
-    for the dated case — dispatch depends on whether start_date is given
+  - _hull_criterion() dispatches to basin_inside_hull() or
+    inventory_decade_hull_gaps() depending on whether start_date is given
   - inventory_decade_hull_gaps() degenerates when start_date is absent (design
     validation: shows why basin_inside_hull() is still needed)
+  - fetch_and_write_timeseries(append=False) drops the table; append=True
+    preserves Pass 1 data — the regression that caused Pass 2 to silently
+    destroy all downloaded records
   - check_data_decade_hull() correctly queries SQLite per decade
   - _year_ranges() compact formatting
 """
 
+import csv
+import gzip
 import importlib.util
+import io
 import sqlite3
 import sys
 from types import ModuleType
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -51,7 +57,9 @@ _spec.loader.exec_module(_mod)
 filter_stations              = _mod.filter_stations
 basin_inside_hull            = _mod.basin_inside_hull
 inventory_decade_hull_gaps   = _mod.inventory_decade_hull_gaps
+_hull_criterion              = _mod._hull_criterion
 check_data_decade_hull       = _mod.check_data_decade_hull
+fetch_and_write_timeseries   = _mod.fetch_and_write_timeseries
 _year_ranges                 = _mod._year_ranges
 
 
@@ -429,3 +437,171 @@ class TestCheckDataDecadeHull:
 
         assert "PRCP" in gaps
         assert 1890 in gaps["PRCP"]
+
+
+# ---------------------------------------------------------------------------
+# _hull_criterion dispatch  (item 5)
+# ---------------------------------------------------------------------------
+
+class TestHullCriterion:
+    """_hull_criterion dispatches to the right check based on start_date."""
+
+    def _surrounding_inv(self, start_yr=1890, end_yr=2020):
+        rows = []
+        for sid in ("SID_N", "SID_S", "SID_E", "SID_W"):
+            rows.append((sid, "PRCP", start_yr, end_yr))
+        return _elem_inv(*rows)
+
+    def test_no_centroid_returns_true(self):
+        df  = _surrounding_stations()
+        inv = self._surrounding_inv()
+        ok, gaps = _hull_criterion(df, inv, {"PRCP": _surrounding_sids()},
+                                   None, "1890-01-01", "2020-12-31")
+        assert ok is True
+        assert gaps == {}
+
+    def test_empty_df_returns_true(self):
+        ok, gaps = _hull_criterion(
+            pd.DataFrame(), _elem_inv(), {}, _centroid(),
+            "1890-01-01", "2020-12-31")
+        assert ok is True
+
+    def test_with_start_date_uses_temporal_check(self):
+        """start_date given → inventory_decade_hull_gaps; early gap detected."""
+        df   = _surrounding_stations()
+        inv  = self._surrounding_inv(start_yr=1950)   # gap before 1950
+        sids = {"PRCP": _surrounding_sids()}
+        ok, gaps = _hull_criterion(df, inv, sids, _centroid(),
+                                   "1890-01-01", "2020-12-31")
+        assert ok is False
+        assert "PRCP" in gaps
+        assert 1890 in gaps["PRCP"]
+
+    def test_with_start_date_full_coverage(self):
+        df   = _surrounding_stations()
+        inv  = self._surrounding_inv(start_yr=1890)
+        sids = {"PRCP": _surrounding_sids()}
+        ok, gaps = _hull_criterion(df, inv, sids, _centroid(),
+                                   "1890-01-01", "2020-12-31")
+        assert ok is True
+        assert gaps == {}
+
+    def test_without_start_date_uses_aggregate_check(self):
+        """No start_date → basin_inside_hull() (aggregate, ignores decades).
+
+        Stations only active 1890–1950 pass the aggregate hull (they have
+        records and surround the basin) even though the temporal check would
+        flag the current decade as uncovered.  Confirms dispatch to
+        basin_inside_hull when start_date is absent.
+        """
+        df   = _surrounding_stations()
+        inv  = self._surrounding_inv(start_yr=1890, end_yr=1950)
+        sids = {"PRCP": _surrounding_sids()}
+        ok, gaps = _hull_criterion(df, inv, sids, _centroid(),
+                                   start_date=None, end_date="2024-12-31")
+        assert ok is True, (
+            "Aggregate check should pass: stations surround the basin even "
+            "though they were only active 1890-1950")
+
+    def test_without_start_date_aggregate_fails(self):
+        """No start_date, centroid outside aggregate hull → False."""
+        df = _station_df(
+            ("SID_A", 46.0, -95.0),
+            ("SID_B", 46.0, -93.0),
+            ("SID_C", 46.0, -91.0),
+        )
+        sids = {"PRCP": {"SID_A", "SID_B", "SID_C"}}
+        inv  = _elem_inv(
+            ("SID_A", "PRCP", 1890, 2020),
+            ("SID_B", "PRCP", 1890, 2020),
+            ("SID_C", "PRCP", 1890, 2020),
+        )
+        ok, gaps = _hull_criterion(df, inv, sids, _centroid(),
+                                   start_date=None, end_date="2024-12-31")
+        assert ok is False
+        assert "_" in gaps   # sentinel key used for aggregate failure
+
+
+# ---------------------------------------------------------------------------
+# append= behaviour in fetch_and_write_timeseries  (item 4)
+# ---------------------------------------------------------------------------
+
+def _make_ghcn_daily_gz(station_id, records):
+    """Synthetic GHCN daily per-station gzip CSV.
+
+    records: list of (date_yyyymmdd, element, value_tenths, q_flag).
+    Columns match the GHCNd per-station format:
+      ID, DATE, ELEMENT, DATA_VALUE, M_FLAG, Q_FLAG, S_FLAG, OBS_TIME
+    """
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    for date, elem, val, qf in records:
+        w.writerow([station_id, date, elem, val, "", qf, "S", ""])
+    return gzip.compress(buf.getvalue().encode())
+
+
+class TestAppendBehavior:
+    """fetch_and_write_timeseries(append=False) drops the table; append=True keeps it.
+
+    Regression: Pass 2 originally called the function with the default append=False,
+    silently destroying all data downloaded in Pass 1.
+    """
+
+    def _run_fetch(self, tmp_path, station_id, cat, gz_content, table, append):
+        """Patch get_mapset_db and requests.get, then call fetch_and_write_timeseries."""
+        mock_resp = MagicMock()
+        mock_resp.content = gz_content
+        mock_resp.raise_for_status = lambda: None
+
+        with patch.object(_mod, 'get_mapset_db',
+                          return_value=str(tmp_path / 'test.db')):
+            with patch('requests.get', return_value=mock_resp):
+                fetch_and_write_timeseries(
+                    [station_id], {station_id: cat}, {"PRCP"},
+                    "1960-01-01", "1969-12-31", "strict", table,
+                    append=append)
+
+    def test_append_false_resets_table(self, tmp_path):
+        """append=False on second call drops the table, losing Pass 1 rows."""
+        table = "ghcn_ts"
+        gz_a = _make_ghcn_daily_gz("SID_A", [("19600615", "PRCP", "100", "")])
+        gz_b = _make_ghcn_daily_gz("SID_B", [])   # no records
+
+        self._run_fetch(tmp_path, "SID_A", 1, gz_a, table, append=False)
+        self._run_fetch(tmp_path, "SID_B", 2, gz_b, table, append=False)
+
+        conn  = sqlite3.connect(str(tmp_path / 'test.db'))
+        count = conn.execute('SELECT COUNT(*) FROM "{}"'.format(table)).fetchone()[0]
+        conn.close()
+        assert count == 0, "append=False dropped the table, destroying Pass 1 data"
+
+    def test_append_true_preserves_pass1_data(self, tmp_path):
+        """append=True keeps existing rows; both passes' data survive."""
+        table = "ghcn_ts"
+        gz_a = _make_ghcn_daily_gz("SID_A", [("19600615", "PRCP", "100", "")])
+        gz_b = _make_ghcn_daily_gz("SID_B", [("19600701", "PRCP", "200", "")])
+
+        self._run_fetch(tmp_path, "SID_A", 1, gz_a, table, append=False)
+        self._run_fetch(tmp_path, "SID_B", 2, gz_b, table, append=True)
+
+        conn = sqlite3.connect(str(tmp_path / 'test.db'))
+        rows = conn.execute(
+            'SELECT cat, station_id FROM "{}" ORDER BY cat'.format(table)
+        ).fetchall()
+        conn.close()
+        assert len(rows) == 2
+        assert rows[0] == (1, "SID_A")
+        assert rows[1] == (2, "SID_B")
+
+    def test_unit_conversion_prcp(self, tmp_path):
+        """PRCP raw value (tenths of mm) is divided by 10 on import."""
+        table = "ghcn_ts"
+        gz = _make_ghcn_daily_gz("SID_A", [("19600615", "PRCP", "100", "")])
+        self._run_fetch(tmp_path, "SID_A", 1, gz, table, append=False)
+
+        conn = sqlite3.connect(str(tmp_path / 'test.db'))
+        val = conn.execute(
+            'SELECT value FROM "{}" WHERE element="PRCP"'.format(table)
+        ).fetchone()[0]
+        conn.close()
+        assert val == pytest.approx(10.0), "100 tenths-mm should convert to 10.0 mm"
