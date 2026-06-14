@@ -19,6 +19,12 @@ instead via the <b>stations</b> option. No authentication is required;
 data are fetched directly from NOAA NCEI over HTTPS.
 </p>
 
+<p>
+When <b>domain=</b> is given, the module runs a two-pass spatial
+expansion that guarantees the basin centroid is enclosed by stations
+with actual data in every temporal period of the requested date range.
+</p>
+
 <h2>NOTES</h2>
 
 <h3>Time series behaviour</h3>
@@ -90,6 +96,79 @@ With <b>q_flags=strict</b> (default), only records with a blank quality
 flag (passed all NCEI quality checks) are imported. Use
 <b>q_flags=all</b> to include records regardless of QC status.
 
+<h3>Station filtering and spatial expansion</h3>
+
+<p>
+Stations are filtered in three stages:
+</p>
+<ol>
+  <li>Bounding box (current region, expanded by <b>padding=</b> and any
+      adaptive expansion) or explicit <b>stations=</b> list.</li>
+  <li>Element presence: only stations with at least one requested element
+      in the GHCN inventory are retained.</li>
+  <li>Record length: if <b>min_years=</b> is set, only stations with at
+      least that many years of overlap with the requested date range are
+      downloaded. This filter controls what is downloaded; it does not
+      affect spatial hull checks (see below).</li>
+</ol>
+
+<p>
+If <b>min_stations=</b> is set, the bounding box is expanded in 0.5°
+steps until the requested number of stations is available for every
+requested element.
+</p>
+
+<p>
+<b>padding=</b> applies a fixed initial expansion to the region bounding
+box before any adaptive expansion begins. It does not count against the
+<b>max_distance=</b> budget.
+</p>
+
+<h3>Domain enclosure (two-pass spatial expansion)</h3>
+
+<p>
+When <b>domain=</b> is given, the module guarantees that the basin
+centroid is spatially enclosed by stations with data in every temporal
+period of the requested date range. This requires
+<tt>scipy</tt> and runs two passes:
+</p>
+
+<p>
+<b>Pass 1 (inventory-based):</b> Before downloading any data, the
+bounding box is expanded until the convex hull of stations with any
+inventory record for each element in the requested period encloses the
+basin centroid. The hull is checked independently for each period of
+length <b>granularity=</b> years (default 10) within
+<b>start_date</b>&ndash;<b>end_date</b>. Stations with even one day of
+inventory coverage in a period contribute to that period's hull,
+regardless of <b>min_years=</b>.
+</p>
+
+<p>
+<b>Pass 2 (data-based):</b> After downloading, the module queries the
+SQLite time series table to verify that stations with actual records in
+each period enclose the centroid. If gaps remain and budget allows, the
+bounding box is expanded further and additional stations are downloaded.
+Pass 2 is the authoritative check; it reflects only downloaded stations
+(those passing <b>min_years=</b> if set).
+</p>
+
+<p>
+Both passes share the <b>max_distance=</b> and <b>max_iterations=</b>
+budget. Expansion stops when either limit is reached. Gaps that cannot
+be closed (budget exhausted, or no surrounding stations exist) produce
+warnings but do not abort — early decades of long records often have
+genuinely sparse coverage regardless of bounding box size.
+</p>
+
+<p>
+The <b>granularity=</b> parameter controls the period length used for
+temporal hull checks. The default of 10 years matches typical
+hydrological calibration intervals. A shorter granularity (e.g. 5)
+imposes a stricter coverage requirement; a longer one (e.g. 30) is
+appropriate for climatological studies.
+</p>
+
 <h3>Time series table schema</h3>
 
 <div class="code"><pre>
@@ -121,7 +200,7 @@ Import station locations and full PRCP record within the current region:
 v.in.ghcn output=gauges
 </pre></div>
 
-Import PRCP and TMAX for 2000–2020, requiring at least 15 years of record:
+Import PRCP and TMAX for 2000&ndash;2020, requiring at least 15 years of record:
 <div class="code"><pre>
 v.in.ghcn output=gauges elements=PRCP,TMAX start_date=2000-01-01 end_date=2020-12-31 min_years=15
 </pre></div>
@@ -131,7 +210,7 @@ Import specific stations by ID:
 v.in.ghcn output=msp stations=USW00014922,USC00218450 start_date=1980-01-01
 </pre></div>
 
-Import monthly precipitation for 1950–2020:
+Import monthly precipitation for 1950&ndash;2020:
 <div class="code"><pre>
 v.in.ghcn output=gauges_mo frequency=monthly start_date=1950-01-01 end_date=2020-12-31
 </pre></div>
@@ -141,16 +220,34 @@ Import station locations only (no time series):
 v.in.ghcn output=gauges -l
 </pre></div>
 
+Import PRCP, TMAX, and TMIN for a watershed, expanding the search until
+stations enclose the basin in every decade from 1950 to present.
+Requires at least 4 stations per element and 10 years of record per station:
+<div class="code"><pre>
+v.in.ghcn output=ghcn_stations elements=PRCP,TMAX,TMIN \
+    start_date=1950-01-01 min_years=10 min_stations=4 \
+    domain=my_basin
+</pre></div>
+
+Same as above but using 5-year coverage periods instead of the default 10:
+<div class="code"><pre>
+v.in.ghcn output=ghcn_stations elements=PRCP,TMAX,TMIN \
+    start_date=1950-01-01 min_years=10 min_stations=4 \
+    granularity=5 domain=my_basin
+</pre></div>
+
 <h2>REQUIREMENTS</h2>
 
 <ul>
   <li>Python packages: <tt>requests</tt>, <tt>pandas</tt>, <tt>geopandas</tt>, <tt>shapely</tt></li>
+  <li><tt>scipy</tt> is additionally required when <b>domain=</b> is used</li>
 </ul>
 
 <h2>SEE ALSO</h2>
 
 <em>
 <a href="v.in.waterdata.html">v.in.waterdata</a>,
+<a href="v.interp.timeseries.html">v.interp.timeseries</a>,
 <a href="db.select.html">db.select</a>,
 <a href="v.db.select.html">v.db.select</a>,
 <a href="t.create.html">t.create</a>
