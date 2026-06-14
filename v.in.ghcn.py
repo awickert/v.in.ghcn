@@ -119,8 +119,17 @@
 #%  key: granularity
 #%  type: integer
 #%  label: Temporal granularity (years) for per-period hull coverage checks
-#%  description: Hull enclosure is verified in non-overlapping periods of this length across the requested date range
-#%  answer: 10
+#%  description: Hull enclosure is verified in non-overlapping periods of this length across the requested date range. Default 1 checks annually.
+#%  answer: 1
+#%  required: no
+#%end
+
+#%option
+#%  key: min_coverage
+#%  type: double
+#%  label: Minimum data coverage fraction [0-1] for a station to contribute to the Pass 2 data hull
+#%  description: Within each granularity period, a station must have records on at least this fraction of days to count toward the hull. 0 (default) requires only one record. Set to e.g. 0.1 to exclude stations with fewer than ~36 records/year while retaining seasonal gauges (~0.4).
+#%  answer: 0.0
 #%  required: no
 #%end
 
@@ -762,20 +771,32 @@ def basin_inside_hull(filtered_df, per_element_sids, centroid_ll):
 
 
 def check_data_decade_hull(cur, table_name, elements, cat_to_xy_ll, centroid_ll,
-                            start_date, end_date, granularity=10):
+                            start_date, end_date, granularity=1, min_coverage=0.0):
     """Check per-period hull coverage using actual downloaded data in SQLite.
 
     For each period of `granularity` years in [start_date, end_date], queries
     which cats have records for each element in that period, builds a convex
     hull from their lon/lat coordinates, and tests containment of centroid_ll.
 
+    min_coverage [0.0–1.0]: fraction of days in the period a station must have
+    records on to contribute to the hull.  0.0 (default) requires only one
+    record.  This filters out stations that appear in the period with just a
+    handful of observations without excluding seasonal gauges: a rain gauge
+    silent in winter (~250 records/year ≈ 0.68) and a snow gauge silent in
+    summer (~150 records/year ≈ 0.41) both pass comfortably at 0.1, while a
+    station with one or two records per year (~0.003–0.005) does not.
+
+    min_coverage is applied to Pass 2 (actual data) only.  Pass 1 (inventory)
+    has no daily record counts and cannot apply this filter.
+
     Returns dict: element -> list of period-start years where hull fails.
     Empty dict means full coverage.
     """
     import numpy as np
+    from datetime import date as _date
     from scipy.spatial import Delaunay
 
-    end_yr   = int(end_date[:4]) if end_date   else date.today().year
+    end_yr   = int(end_date[:4]) if end_date   else _date.today().year
     start_yr = int(start_date[:4]) if start_date else end_yr
     period_starts = list(range((start_yr // granularity) * granularity,
                                end_yr + 1, granularity))
@@ -787,13 +808,28 @@ def check_data_decade_hull(cur, table_name, elements, cat_to_xy_ll, centroid_ll,
     for elem in elements:
         elem_gaps = []
         for period in period_starts:
-            cur.execute(
-                'SELECT DISTINCT cat FROM "{}" WHERE element=? '
-                'AND datetime >= ? AND datetime <= ?'.format(table_name),
-                (elem,
-                 '{:04d}-01-01'.format(period),
-                 '{:04d}-12-31'.format(period + granularity - 1))
-            )
+            period_start_str = '{:04d}-01-01'.format(period)
+            period_end_str   = '{:04d}-12-31'.format(period + granularity - 1)
+
+            if min_coverage > 0.0:
+                # Count records per cat; require >= min_coverage * days_in_period
+                period_start_d = _date(period, 1, 1)
+                period_end_d   = _date(min(period + granularity - 1,
+                                           end_yr), 12, 31)
+                days_in_period = (period_end_d - period_start_d).days + 1
+                min_records    = min_coverage * days_in_period
+                cur.execute(
+                    'SELECT cat FROM "{}" WHERE element=? '
+                    'AND datetime >= ? AND datetime <= ? '
+                    'GROUP BY cat HAVING COUNT(*) >= ?'.format(table_name),
+                    (elem, period_start_str, period_end_str, min_records)
+                )
+            else:
+                cur.execute(
+                    'SELECT DISTINCT cat FROM "{}" WHERE element=? '
+                    'AND datetime >= ? AND datetime <= ?'.format(table_name),
+                    (elem, period_start_str, period_end_str)
+                )
             active_cats = {row[0] for row in cur.fetchall()}
             coords = np.array([cat_to_xy_ll[c] for c in active_cats
                                 if c in cat_to_xy_ll], dtype=np.float64)
@@ -853,7 +889,8 @@ def main():
     sample_map     = options['domain']              if options['domain']         else None
     max_distance   = float(options['max_distance']) if options['max_distance']   else 10.0
     max_iterations = int(options['max_iterations']) if options['max_iterations'] else 40
-    granularity    = int(options['granularity'])    if options['granularity']    else 10
+    granularity    = int(options['granularity'])    if options['granularity']    else 1
+    min_coverage   = float(options['min_coverage']) if options['min_coverage']   else 0.0
     q_flags        = options['q_flags']
     flag_locations = flags['l']
 
@@ -1049,7 +1086,8 @@ def main():
         while True:
             gaps = check_data_decade_hull(
                 cur2, table_name, elements, cat_to_xy_ll,
-                centroid_ll, start_date, end_date, granularity=granularity)
+                centroid_ll, start_date, end_date,
+                granularity=granularity, min_coverage=min_coverage)
             if not gaps:
                 gs.message("Pass 2: data-based hull check passed.")
                 break

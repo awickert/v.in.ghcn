@@ -34,6 +34,8 @@ GRASS GIS addon that pulls NOAA GHCN-Daily (GHCNd) climate station data into a G
 | `domain` | vector name | — | Domain polygon; bbox expanded until stations enclose it (two passes) |
 | `max_distance` | double | `10.0` | Maximum total bbox expansion in degrees; shared across both passes |
 | `max_iterations` | integer | `40` | Maximum expansion steps (0.5° each); shared across both passes |
+| `granularity` | integer | `1` | Period length in years for temporal hull checks |
+| `min_coverage` | double | `0.0` | Fraction of days [0–1] a station must have records in a period to contribute to the Pass 2 hull; 0 = any record qualifies |
 | `q_flags` | string | `strict` | `strict` (blank q_flag only) or `all` |
 | `-l` | flag | — | Import station locations only, skip time series download |
 
@@ -46,12 +48,16 @@ Expands bbox in 0.5° steps until:
 - `min_stations` met for every element (if specified), AND
 - basin centroid inside the convex hull of stations with **any inventory record** for each element in the requested period (per `per_element_sids` from `filter_stations()` — independent of `min_years`)
 
+Pass 1 uses `granularity`-year windows and the inventory `firstyear`/`lastyear` span. It cannot apply `min_coverage` (no daily record counts available).
+
 **Pass 2 (data-based, after download):**  
-Checks SQLite per period (`granularity` years, default 10): for each element, queries which cats have actual records in that period, builds hull, tests centroid. Expands and downloads additional stations if gaps remain. Uses same `max_distance`/`max_iterations` budget as Pass 1 — both passes share a single `expansion` counter and `iterations` counter. The stop condition is OR: expansion halts when either limit is reached. This is intentional: the defaults (10°, 40 steps) are generous enough that Pass 1 rarely exhausts the budget. Pass 2 is the authoritative coverage check — it only sees downloaded stations (those passing `min_years`), so it correctly accounts for stations that Pass 1 considered but were not downloaded.
+Checks SQLite per `granularity`-year period (default 1 = annual): for each element, queries which cats have records in that period, builds hull, tests centroid. Expands and downloads additional stations if gaps remain. Uses same `max_distance`/`max_iterations` budget as Pass 1 — both passes share a single `expansion` counter and `iterations` counter. The stop condition is OR: expansion halts when either limit is reached. This is intentional: the defaults (10°, 40 steps) are generous enough that Pass 1 rarely exhausts the budget. Pass 2 is the authoritative coverage check — it only sees downloaded stations (those passing `min_years`), so it correctly accounts for stations that Pass 1 considered but were not downloaded.
+
+`min_coverage` is applied in Pass 2 only. Within each period a station must have records on at least `min_coverage × days_in_period` days to contribute to the hull. This excludes stations that appear in a period with only a handful of records without disqualifying seasonal gauges: a rain gauge silent in winter (~250 records/year ≈ 0.68) and a snow gauge silent in summer (~150 records/year ≈ 0.41) both pass at `min_coverage=0.1`, while a station with 1–2 records per year (~0.003–0.005) does not.
 
 Hull test uses `scipy.spatial.Delaunay.find_simplex()`. Fewer than 3 stations with data for any element immediately fails the hull check.
 
-Temporal hull gaps that cannot be closed by expansion (budget exhausted) produce warnings but do not abort — early decades often have no surrounding stations regardless of bbox size.
+Temporal hull gaps that cannot be closed by expansion (budget exhausted) produce warnings but do not abort — early years of long records often have no surrounding stations regardless of bbox size.
 
 ## Python dependencies
 

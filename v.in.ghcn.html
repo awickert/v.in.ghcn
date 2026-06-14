@@ -163,10 +163,25 @@ genuinely sparse coverage regardless of bounding box size.
 
 <p>
 The <b>granularity=</b> parameter controls the period length used for
-temporal hull checks. The default of 10 years matches typical
-hydrological calibration intervals. A shorter granularity (e.g. 5)
-imposes a stricter coverage requirement; a longer one (e.g. 30) is
-appropriate for climatological studies.
+temporal hull checks. The default of 1 year checks annually: a station
+must have at least some data in a given year to contribute to that
+year's hull. Larger values (e.g. 10) are coarser but may be appropriate
+for climatological studies where annual gaps are acceptable.
+</p>
+
+<p>
+<b>min_coverage=</b> controls how much data a station must have within
+each period to count toward the Pass 2 hull. The value is a fraction of
+days in the period [0&ndash;1]; the default 0 requires only a single
+record. Setting <b>min_coverage=0.1</b> requires at least roughly 36
+records per year, which excludes stations with only occasional
+observations while retaining seasonal gauges: a rain gauge that does not
+operate in winter (~250 records/year &asymp; 0.68) and a snow gauge that
+does not operate in summer (~150 records/year &asymp; 0.41) both pass
+comfortably, while a station with one or two records per year
+(&asymp; 0.003&ndash;0.005) does not. <b>min_coverage</b> is applied
+only in Pass 2; Pass 1 uses the GHCN inventory (first/last year only)
+and cannot count daily records.
 </p>
 
 <h3>Time series table schema</h3>
@@ -220,20 +235,23 @@ Import station locations only (no time series):
 v.in.ghcn output=gauges -l
 </pre></div>
 
-Import PRCP, TMAX, and TMIN for a watershed, expanding the search until
-stations enclose the basin in every decade from 1950 to present.
-Requires at least 4 stations per element and 10 years of record per station:
+Import PRCP, TMAX, and TMIN for a watershed from 1950 to present,
+expanding the search until stations enclose the basin in every year.
+Stations with fewer than ~10% daily coverage in a year are excluded
+from the hull check to avoid counting stations with only occasional
+observations:
 <div class="code"><pre>
 v.in.ghcn output=ghcn_stations elements=PRCP,TMAX,TMIN \
-    start_date=1950-01-01 min_years=10 min_stations=4 \
+    start_date=1950-01-01 min_coverage=0.1 \
     domain=my_basin
 </pre></div>
 
-Same as above but using 5-year coverage periods instead of the default 10:
+Same as above but using 10-year periods instead of annual (coarser
+check, fewer expansion steps):
 <div class="code"><pre>
 v.in.ghcn output=ghcn_stations elements=PRCP,TMAX,TMIN \
-    start_date=1950-01-01 min_years=10 min_stations=4 \
-    granularity=5 domain=my_basin
+    start_date=1950-01-01 min_coverage=0.1 \
+    granularity=10 domain=my_basin
 </pre></div>
 
 <h2>REQUIREMENTS</h2>
