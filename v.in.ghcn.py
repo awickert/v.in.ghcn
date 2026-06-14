@@ -384,6 +384,74 @@ def report_temporal_coverage(df, elem_inv_df, elements, start_date, end_date,
                     elem, len(sparse), sparse_threshold, _year_ranges(sparse)))
 
 
+def report_temporal_hull_coverage(filtered_df, elem_inv_df, per_element_sids,
+                                   centroid_ll, start_date, end_date):
+    """Warn about decades where the basin centroid falls outside the station hull.
+
+    For each decade in the requested date range, builds the convex hull from
+    stations whose inventory overlaps that decade AND which passed the per-element
+    data-coverage filter (per_element_sids). Reports decades where the hull does
+    not enclose the basin centroid.
+
+    This is a warning-only check: sparse early decades may be unfixable by bbox
+    expansion (no more stations exist), so we inform rather than block.
+    """
+    import numpy as np
+    from scipy.spatial import Delaunay
+
+    end_yr   = int(end_date[:4]) if end_date   else date.today().year
+    start_yr = int(start_date[:4]) if start_date else end_yr
+
+    lon_c, lat_c = centroid_ll
+    pt = np.array([[lon_c, lat_c]])
+
+    decade_starts = list(range((start_yr // 10) * 10, end_yr + 1, 10))
+
+    gaps = {}   # elem -> list of decade-start years without hull enclosure
+
+    for elem, sids in per_element_sids.items():
+        ef_elem = elem_inv_df[
+            (elem_inv_df['element'] == elem) &
+            (elem_inv_df['station_id'].isin(sids))
+        ]
+        elem_gaps = []
+        for dec in decade_starts:
+            dec_end = dec + 9
+            # Stations active in this decade
+            active = ef_elem[
+                (ef_elem['firstyear'] <= dec_end) &
+                (ef_elem['lastyear']  >= dec)
+            ]
+            coords = filtered_df[
+                filtered_df['station_id'].isin(set(active['station_id']))
+            ][['longitude', 'latitude']].values.astype(np.float64)
+
+            if len(coords) < 3:
+                elem_gaps.append(dec)
+                continue
+            try:
+                hull = Delaunay(coords)
+            except Exception:
+                elem_gaps.append(dec)
+                continue
+            if hull.find_simplex(pt)[0] < 0:
+                elem_gaps.append(dec)
+
+        if elem_gaps:
+            gaps[elem] = elem_gaps
+
+    if not gaps:
+        gs.message("Temporal hull check: basin enclosed by active stations in all decades.")
+        return
+
+    for elem, bad_decades in sorted(gaps.items()):
+        ranges_str = _year_ranges(bad_decades)
+        gs.warning(
+            "Temporal hull gap — {}: basin centroid outside active-station hull "
+            "for decade(s) starting: {}. Spatial interpolation will extrapolate "
+            "for these periods.".format(elem, ranges_str))
+
+
 def get_cat_map(output):
     """Return dict mapping station_id → cat from the imported vector map."""
     raw = gs.read_command('v.db.select', map=output, columns='cat,station_id', flags='c')
@@ -772,11 +840,15 @@ def main():
                 "Station criteria satisfied after {:.1f}° expansion "
                 "({} stations total).".format(expansion, len(filtered)))
     else:
-        filtered, elem_counts, _ = filter_stations(
+        filtered, elem_counts, elem_sids = filter_stations(
             station_df, elem_inv_df, bbox, station_ids,
             elements, min_years, start_date, end_date)
 
     report_temporal_coverage(filtered, elem_inv_df, elements, start_date, end_date)
+
+    if centroid_ll:
+        report_temporal_hull_coverage(
+            filtered, elem_inv_df, elem_sids, centroid_ll, start_date, end_date)
 
     import geopandas as gpd
     from shapely.geometry import Point
