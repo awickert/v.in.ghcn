@@ -44,12 +44,12 @@ When `domain=` is given, the module runs two passes to ensure the station convex
 **Pass 1 (inventory-based, fast):**  
 Expands bbox in 0.5° steps until:
 - `min_stations` met for every element (if specified), AND
-- basin centroid inside the convex hull of stations with ≥`min_years` for EACH element (per `per_element_sids` from `filter_stations()`)
+- basin centroid inside the convex hull of stations with **any inventory record** for each element in the requested period (per `per_element_sids` from `filter_stations()` — independent of `min_years`)
 
 **Pass 2 (data-based, after download):**  
-Checks SQLite per decade (10-year windows): for each element, queries which cats have actual records in that decade, builds hull, tests centroid. Expands and downloads additional stations if gaps remain. Uses same `max_distance`/`max_iterations` budget as Pass 1.
+Checks SQLite per period (`granularity` years, default 10): for each element, queries which cats have actual records in that period, builds hull, tests centroid. Expands and downloads additional stations if gaps remain. Uses same `max_distance`/`max_iterations` budget as Pass 1 — both passes share a single `expansion` counter and `iterations` counter. The stop condition is OR: expansion halts when either limit is reached. This is intentional: the defaults (10°, 40 steps) are generous enough that Pass 1 rarely exhausts the budget. Pass 2 is the authoritative coverage check — it only sees downloaded stations (those passing `min_years`), so it correctly accounts for stations that Pass 1 considered but were not downloaded.
 
-Hull test uses `scipy.spatial.Delaunay.find_simplex()`. Fewer than 3 qualifying stations for any element immediately fails the hull check.
+Hull test uses `scipy.spatial.Delaunay.find_simplex()`. Fewer than 3 stations with data for any element immediately fails the hull check.
 
 Temporal hull gaps that cannot be closed by expansion (budget exhausted) produce warnings but do not abort — early decades often have no surrounding stations regardless of bbox size.
 
@@ -71,14 +71,18 @@ Temporal hull gaps that cannot be closed by expansion (budget exhausted) produce
 
 - `fetch_station_inventory()`: fixed-width parse with `colspecs` — column positions are specific to the GHCNd format and must not be changed
 - `fetch_element_inventory()`: whitespace-delimited, 6 columns
-- `filter_stations()`: bbox filter → element filter → min_years filter (in that order). Returns **3-tuple** `(df, per_element_counts, per_element_sids)`. `per_element_sids` maps each element to the set of `station_id`s with ≥`min_years` for THAT element — used for convex hull checks. The `fatal=False` early-return path also returns a 3-tuple `(empty_df, {}, {})`.
+- `filter_stations()`: bbox filter → element filter → then two parallel outputs. Returns **3-tuple** `(df, per_element_counts, per_element_sids)`.
+  - `per_element_sids` (hull criterion): all bbox stations with **any** inventory record for the element within the requested date range, regardless of `min_years`. A station with even one day of data can contribute to the spatial hull for the period it covers.
+  - `per_element_counts` (min_stations criterion) + `df` (download set): both filtered by `min_years` if specified. A station must meet `min_years` to be downloaded and counted toward `min_stations`.
+  - The decoupling is intentional: temporal coverage is a property of the station collection across periods (checked by the hull functions), not a per-station record-length requirement.
+  - The `fatal=False` early-return path returns a 3-tuple `(empty_df, {}, {})`.
 - `get_mapset_db()`: returns path to mapset SQLite db (`{GISDBASE}/{LOCATION}/{MAPSET}/sqlite/sqlite.db`), creating the directory if needed. Used by both fetch functions instead of duplicating the path logic.
 - `fetch_and_write_timeseries()`: per-station gzip fetch, CSV parse, date filter, unit conversion, batch `executemany` insert. `append=False` (default) drops and recreates the table; `append=True` inserts into the existing table. Pass 2 must use `append=True` to avoid destroying Pass 1 data.
 - `fetch_and_write_monthly_timeseries()`: same `append=` contract.
 - `get_sample_centroid_ll()`: extracts basin centroid in lon/lat via `v.out.ascii input= format=point type=centroid`, then `m.proj flags=od`. Falls back to bbox centre if centroid features are absent.
-- `_hull_criterion(filtered_df, elem_inv_df, per_element_sids, centroid_ll, start_date, end_date)`: returns `(ok: bool, inv_gaps: dict)`. Dispatches to `inventory_decade_hull_gaps()` when `start_date` is set, or `basin_inside_hull()` when not (because `inventory_decade_hull_gaps` degenerates to a single current-decade check without `start_date`). Called in both the Pass 1 expansion loop and the no-expansion else branch.
-- `basin_inside_hull()`: aggregate hull check — centroid inside Delaunay hull of per-element qualifying stations. Used by `_hull_criterion` when `start_date` is absent. Returns False if any element has < 3 stations.
-- `check_data_decade_hull()`: Pass 2 per-decade check using actual SQLite records. Returns `{element: [decade_start_years_with_gaps]}`.
+- `_hull_criterion(filtered_df, elem_inv_df, per_element_sids, centroid_ll, start_date, end_date, granularity)`: returns `(ok: bool, inv_gaps: dict)`. Dispatches to `inventory_decade_hull_gaps()` when `start_date` is set, or `basin_inside_hull()` when not (because `inventory_decade_hull_gaps` degenerates to a single current-period check without `start_date`). Called in both the Pass 1 expansion loop and the no-expansion else branch. `per_element_sids` passed in is already decoupled from `min_years`.
+- `basin_inside_hull()`: aggregate hull check — centroid inside Delaunay hull of per-element stations with any data. Used by `_hull_criterion` when `start_date` is absent. Returns False if any element has < 3 stations.
+- `check_data_decade_hull()`: Pass 2 per-period check using actual SQLite records. Returns `{element: [period_start_years_with_gaps]}`. This is the authoritative coverage check — it sees only downloaded stations, so it correctly reflects what `min_years` excluded.
 - `report_temporal_hull_coverage()`: inventory-based per-decade warning (Pass 1 diagnostic, not blocking).
 - **Deferred vector write**: cats are pre-assigned in memory (sorted alphabetically by `station_id`, `cat = 1..N`) before any data download. `geodataframe_to_grass()` is called once after all expansion rounds. `get_cat_map()` has been removed (was dead code after deferred vector write was introduced).
 - `geodataframe_to_grass()`: `mkstemp` placeholder removed before `gdf.to_file()` — fiona must create the GeoPackage itself.
