@@ -400,17 +400,21 @@ def report_temporal_coverage(df, elem_inv_df, elements, start_date, end_date,
                     elem, len(sparse), sparse_threshold, _year_ranges(sparse)))
 
 
-def report_temporal_hull_coverage(filtered_df, elem_inv_df, per_element_sids,
-                                   centroid_ll, start_date, end_date):
-    """Warn about decades where the basin centroid falls outside the station hull.
+def inventory_decade_hull_gaps(filtered_df, elem_inv_df, per_element_sids,
+                               centroid_ll, start_date, end_date):
+    """Return per-element inventory hull gaps across decades.
 
-    For each decade in the requested date range, builds the convex hull from
-    stations whose inventory overlaps that decade AND which passed the per-element
-    data-coverage filter (per_element_sids). Reports decades where the hull does
-    not enclose the basin centroid.
+    For each decade in [start_date, end_date], checks whether the basin centroid
+    falls inside the convex hull of stations that (a) passed per-element min_years
+    filtering (per_element_sids) and (b) have inventory overlap with that decade
+    (firstyear <= dec+9 AND lastyear >= dec).
 
-    This is a warning-only check: sparse early decades may be unfixable by bbox
-    expansion (no more stations exist), so we inform rather than block.
+    Returns dict: element -> list of decade-start years where hull fails.
+    Empty dict means full inventory-level temporal coverage.
+
+    Used as a Pass 1 expansion criterion so the bbox is enlarged until the
+    inventory predicts surrounding coverage in every decade, before any data
+    is downloaded.
     """
     import numpy as np
     from scipy.spatial import Delaunay
@@ -422,8 +426,7 @@ def report_temporal_hull_coverage(filtered_df, elem_inv_df, per_element_sids,
     pt = np.array([[lon_c, lat_c]])
 
     decade_starts = list(range((start_yr // 10) * 10, end_yr + 1, 10))
-
-    gaps = {}   # elem -> list of decade-start years without hull enclosure
+    gaps = {}
 
     for elem, sids in per_element_sids.items():
         ef_elem = elem_inv_df[
@@ -432,10 +435,8 @@ def report_temporal_hull_coverage(filtered_df, elem_inv_df, per_element_sids,
         ]
         elem_gaps = []
         for dec in decade_starts:
-            dec_end = dec + 9
-            # Stations active in this decade
             active = ef_elem[
-                (ef_elem['firstyear'] <= dec_end) &
+                (ef_elem['firstyear'] <= dec + 9) &
                 (ef_elem['lastyear']  >= dec)
             ]
             coords = filtered_df[
@@ -456,16 +457,19 @@ def report_temporal_hull_coverage(filtered_df, elem_inv_df, per_element_sids,
         if elem_gaps:
             gaps[elem] = elem_gaps
 
-    if not gaps:
-        gs.message("Temporal hull check: basin enclosed by active stations in all decades.")
-        return
+    return gaps
 
+
+def report_inventory_hull_gaps(gaps):
+    """Print inventory hull gap dict returned by inventory_decade_hull_gaps()."""
+    if not gaps:
+        gs.message("Inventory temporal hull: basin enclosed in all decades.")
+        return
     for elem, bad_decades in sorted(gaps.items()):
-        ranges_str = _year_ranges(bad_decades)
         gs.warning(
-            "Temporal hull gap — {}: basin centroid outside active-station hull "
-            "for decade(s) starting: {}. Spatial interpolation will extrapolate "
-            "for these periods.".format(elem, ranges_str))
+            "Inventory hull gap — {}: basin centroid outside active-station hull "
+            "for decade(s) starting: {}. Spatial interpolation may extrapolate "
+            "for these periods.".format(elem, _year_ranges(bad_decades)))
 
 
 def get_cat_map(output):
@@ -710,36 +714,6 @@ def get_sample_centroid_ll(sample_map):
     return float(lon), float(lat)
 
 
-def basin_inside_hull(filtered_df, per_element_sids, centroid_ll):
-    """Return True if centroid_ll is inside the station convex hull for every element.
-
-    per_element_sids maps each element to the set of station_ids that have
-    confirmed data coverage for that element within the requested date range
-    (produced by filter_stations). Only those stations contribute to each
-    element's hull, so the check reflects actual data availability, not just
-    inventory presence.
-
-    Returns False for any element with fewer than 3 qualifying stations.
-    """
-    import numpy as np
-    from scipy.spatial import Delaunay
-
-    lon_c, lat_c = centroid_ll
-    pt = np.array([[lon_c, lat_c]])
-
-    for elem, sids in per_element_sids.items():
-        coords = filtered_df[filtered_df['station_id'].isin(sids)][
-            ['longitude', 'latitude']].values.astype(np.float64)
-        if len(coords) < 3:
-            return False
-        try:
-            hull = Delaunay(coords)
-        except Exception:
-            return False
-        if hull.find_simplex(pt)[0] < 0:
-            return False
-    return True
-
 
 def check_data_decade_hull(cur, table_name, elements, cat_to_xy_ll, centroid_ll,
                             start_date, end_date):
@@ -869,6 +843,8 @@ def main():
     expansion  = 0.0
     iterations = 0
 
+    inv_gaps = {}   # populated inside the loop when centroid_ll is set
+
     if need_expansion:
         while True:
             filtered, elem_counts, elem_sids = filter_stations(
@@ -878,11 +854,18 @@ def main():
             counts_ok = (not min_stations or
                          (not filtered.empty and
                           min(elem_counts.get(el, 0) for el in elements) >= min_stations))
-            hull_ok   = (not centroid_ll or
-                         (not filtered.empty and
-                          basin_inside_hull(filtered, elem_sids, centroid_ll)))
 
-            if counts_ok and hull_ok:
+            # Per-decade inventory hull check subsumes the aggregate hull check:
+            # if all decades pass, the aggregate hull trivially passes too.
+            if centroid_ll and not filtered.empty:
+                inv_gaps = inventory_decade_hull_gaps(
+                    filtered, elem_inv_df, elem_sids,
+                    centroid_ll, start_date, end_date)
+            else:
+                inv_gaps = {} if (not centroid_ll) else {'_': ['no stations']}
+            temporal_hull_ok = not inv_gaps
+
+            if counts_ok and temporal_hull_ok:
                 break
 
             if expansion >= max_distance or iterations >= max_iterations:
@@ -892,12 +875,19 @@ def main():
                         min_stations,
                         ', '.join('{}={}'.format(el, elem_counts.get(el, 0))
                                   for el in elements)))
-                if not hull_ok:
-                    reasons.append("basin centroid outside station hull for ≥1 element")
-                gs.fatal(
-                    "Could not satisfy station criteria within {:.1f}° / {:d} steps:\n"
-                    "  {}\nRaise max_distance/max_iterations or loosen filters.".format(
-                        max_distance, max_iterations, '\n  '.join(reasons)))
+                if not temporal_hull_ok:
+                    reasons.append(
+                        "inventory hull gap in decade(s): {}".format(
+                            ', '.join(
+                                '{} {}'.format(el, _year_ranges(bad))
+                                for el, bad in sorted(inv_gaps.items()))))
+                gs.warning(
+                    "Pass 1: could not satisfy all criteria within "
+                    "{:.1f}° / {:d} steps: {}. "
+                    "Proceeding with best available stations; Pass 2 will "
+                    "verify data coverage.".format(
+                        max_distance, max_iterations, '; '.join(reasons)))
+                break
 
             w -= _STEP; s -= _STEP; e += _STEP; n += _STEP
             expansion  += _STEP
@@ -905,26 +895,32 @@ def main():
             reasons = []
             if not counts_ok:
                 reasons.append("min_stations={} not met".format(min_stations))
-            if not hull_ok:
-                reasons.append("basin outside hull")
+            if not temporal_hull_ok:
+                bad_summary = ', '.join(
+                    '{} {}'.format(el, _year_ranges(bad))
+                    for el, bad in sorted(inv_gaps.items()))
+                reasons.append("inventory hull gap: {}".format(bad_summary))
             gs.message(
                 "  Pass 1: {} — expanding by {:.1f}° (total: {:.1f}°, step {:d})".format(
                     ', '.join(reasons), _STEP, expansion, iterations))
 
         if expansion > 0.0:
             gs.message(
-                "Pass 1 criteria satisfied after {:.1f}° / {:d} step(s) "
-                "({} stations).".format(expansion, iterations, len(filtered)))
+                "Pass 1 complete: {:.1f}° / {:d} step(s), {:d} stations.".format(
+                    expansion, iterations, len(filtered)))
     else:
         filtered, elem_counts, elem_sids = filter_stations(
             station_df, elem_inv_df, bbox, station_ids,
             elements, min_years, start_date, end_date)
+        if centroid_ll and not filtered.empty:
+            inv_gaps = inventory_decade_hull_gaps(
+                filtered, elem_inv_df, elem_sids,
+                centroid_ll, start_date, end_date)
 
     report_temporal_coverage(filtered, elem_inv_df, elements, start_date, end_date)
 
     if centroid_ll:
-        report_temporal_hull_coverage(
-            filtered, elem_inv_df, elem_sids, centroid_ll, start_date, end_date)
+        report_inventory_hull_gaps(inv_gaps)
 
     if flag_locations:
         # Write vector and return without downloading time series.
