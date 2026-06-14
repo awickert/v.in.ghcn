@@ -829,9 +829,10 @@ def main():
     if frequency == 'monthly':
         non_prcp = [e for e in elements_str.split(',') if e.strip().upper() != 'PRCP']
         if non_prcp:
-            gs.warning(
-                "Monthly frequency only supports PRCP. "
-                "Elements '{}' will be skipped.".format(', '.join(non_prcp))
+            gs.fatal(
+                "Elements '{}' are not currently available via this GRASS GIS module "
+                "for frequency=monthly. Only PRCP is supported for monthly frequency.".format(
+                    ', '.join(non_prcp))
             )
 
     require_package('requests')
