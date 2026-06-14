@@ -93,6 +93,12 @@
 #%  required: no
 #%end
 
+#%option G_OPT_V_INPUT
+#%  key: sample
+#%  label: Basin polygon map; bbox is expanded until the basin falls inside the station convex hull for each element
+#%  required: no
+#%end
+
 #%option
 #%  key: q_flags
 #%  type: string
@@ -578,6 +584,47 @@ def fetch_and_write_monthly_timeseries(station_ids, cat_map, start_date, end_dat
     return total_rows
 
 
+def get_sample_centroid_ll(sample_map):
+    """Return (lon, lat) in decimal degrees for the centroid of a polygon map."""
+    out = gs.read_command('v.out.ascii', map=sample_map, format='point',
+                          type='centroid', separator='pipe', quiet=True)
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    if not lines:
+        gs.fatal("No centroid found in sample= map '{}'.".format(sample_map))
+    x, y = lines[0].split('|')[:2]
+    proj_out = gs.read_command('m.proj', coordinates='{},{}'.format(x, y),
+                               flags='od', quiet=True)
+    lon, lat = proj_out.strip().split('|')[:2]
+    return float(lon), float(lat)
+
+
+def basin_inside_hull(filtered_df, elem_inv_df, elements, centroid_ll):
+    """Return True if centroid_ll is inside the station convex hull for every element.
+
+    A hull is formed from stations in filtered_df that carry each element.
+    Returns False for any element with fewer than 3 stations (hull undefined).
+    """
+    import numpy as np
+    from scipy.spatial import Delaunay
+
+    lon_c, lat_c = centroid_ll
+    pt = np.array([[lon_c, lat_c]])
+
+    for elem in elements:
+        elem_sids = set(elem_inv_df[elem_inv_df['element'] == elem]['station_id'])
+        coords = filtered_df[filtered_df['station_id'].isin(elem_sids)][
+            ['longitude', 'latitude']].values.astype(np.float64)
+        if len(coords) < 3:
+            return False
+        try:
+            hull = Delaunay(coords)
+        except Exception:
+            return False
+        if hull.find_simplex(pt)[0] < 0:
+            return False
+    return True
+
+
 def main():
     options, flags = gs.parser()
     atexit.register(cleanup)
@@ -591,6 +638,7 @@ def main():
     min_years     = int(options['min_years'])     if options['min_years']     else None
     padding       = float(options['padding'])     if options['padding']       else 0.0
     min_stations  = int(options['min_stations'])  if options['min_stations']  else None
+    sample_map    = options['sample']             if options['sample']        else None
     q_flags       = options['q_flags']
     flag_locations = flags['l']
 
@@ -638,9 +686,19 @@ def main():
     station_df = fetch_station_inventory()
     elem_inv_df = fetch_element_inventory()
 
-    # Adaptive expansion: grow bbox by 0.5° per step until min_stations is reached
-    # for EACH requested element independently.
-    if min_stations and not station_ids:
+    # Get basin centroid in lon/lat for hull containment check (if sample= given).
+    centroid_ll = get_sample_centroid_ll(sample_map) if sample_map else None
+    if centroid_ll:
+        require_package('scipy')
+        gs.message("Basin centroid for hull check: lon={:.4f} lat={:.4f}".format(*centroid_ll))
+
+    # Adaptive expansion: grow bbox by 0.5° per step until BOTH criteria are met
+    # for each element independently:
+    #   (a) min_stations threshold, if specified
+    #   (b) basin centroid lies inside the station convex hull, if sample= given
+    # Either criterion alone is sufficient to trigger expansion; both must pass to stop.
+    need_expansion = (min_stations or centroid_ll) and not station_ids
+    if need_expansion:
         _STEP = 0.5   # degrees per expansion step
         _MAX  = 10.0  # maximum total expansion in each direction
         w, s, e, n = bbox
@@ -649,26 +707,46 @@ def main():
             filtered, elem_counts = filter_stations(
                 station_df, elem_inv_df, (w, s, e, n),
                 None, elements, min_years, start_date, end_date, fatal=False)
-            if (not filtered.empty and
-                    min(elem_counts.get(el, 0) for el in elements) >= min_stations):
+
+            counts_ok = (not min_stations or
+                         (not filtered.empty and
+                          min(elem_counts.get(el, 0) for el in elements) >= min_stations))
+            hull_ok   = (not centroid_ll or
+                         (not filtered.empty and
+                          basin_inside_hull(filtered, elem_inv_df, elements, centroid_ll)))
+
+            if counts_ok and hull_ok:
                 break
+
             expansion += _STEP
             if expansion > _MAX:
+                reasons = []
+                if not counts_ok:
+                    reasons.append("min_stations={} not met ({})".format(
+                        min_stations,
+                        ', '.join('{}={}'.format(el, elem_counts.get(el, 0))
+                                  for el in elements)))
+                if not hull_ok:
+                    reasons.append("basin centroid outside station hull for ≥1 element")
                 gs.fatal(
-                    "Could not find {} stations per element within {:.0f}° of "
-                    "the region. Loosen min_years or min_stations.\n"
-                    "Current per-element counts: {}".format(
-                        min_stations, _MAX,
-                        ', '.join('{}={}'.format(e, elem_counts.get(e, 0))
-                                  for e in elements)))
+                    "Could not satisfy station criteria within {:.0f}° of the region:\n"
+                    "  {}\nLoosen min_years, min_stations, or check station availability.".format(
+                        _MAX, '\n  '.join(reasons)))
+
             w -= _STEP; s -= _STEP; e += _STEP; n += _STEP
+            reasons = []
+            if not counts_ok:
+                reasons.append("min_stations={} not met".format(min_stations))
+            if not hull_ok:
+                reasons.append("basin outside hull")
             gs.message(
-                "  min_stations={} not met for all elements — expanding by "
-                "{:.1f}° (total: {:.1f}°)".format(min_stations, _STEP, expansion))
+                "  {} — expanding by {:.1f}° (total: {:.1f}°)".format(
+                    ', '.join(reasons), _STEP, expansion))
+
         if expansion > 0.0:
             gs.message(
-                "min_stations={} per element satisfied after {:.1f}° expansion "
-                "({} stations total).".format(min_stations, expansion, len(filtered)))
+                "Station criteria satisfied after {:.1f}° expansion "
+                "({} stations total).".format(expansion, len(filtered)))
     else:
         filtered, elem_counts = filter_stations(
             station_df, elem_inv_df, bbox, station_ids,
