@@ -262,13 +262,20 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
                     start_date, end_date, fatal=True):
     """Filter station inventory to bbox/IDs, requested elements, and min_years.
 
-    Returns (df, per_element_counts) where per_element_counts maps each requested
-    element to the number of stations that carry it with sufficient years of record.
-    A station qualifies for the overall df if it has ANY element with enough years;
-    per_element_counts reflects how many stations have EACH element specifically.
+    Returns 3-tuple (df, per_element_counts, per_element_sids):
+      df                  -- stations to download (pass min_years if set)
+      per_element_counts  -- {element: count} of stations in df per element;
+                             used for min_stations checks
+      per_element_sids    -- {element: set of station_ids} with ANY inventory
+                             record for the element in the requested period;
+                             independent of min_years — used for hull checks
 
-    When fatal=False an empty DataFrame is returned (with empty counts) instead of
-    calling gs.fatal for the bbox-empty case; used by the adaptive expansion loop.
+    The decoupling is intentional: temporal hull coverage is a property of the
+    station collection across periods, not a per-station record-length requirement.
+    A station with even one day of data contributes to the hull for its period.
+
+    When fatal=False an empty DataFrame is returned instead of calling gs.fatal
+    for the bbox-empty case; used by the adaptive expansion loop.
     """
     if station_ids:
         df = station_df[station_df['station_id'].isin(station_ids)].copy()
@@ -727,12 +734,12 @@ def get_sample_centroid_ll(sample_map):
 
 
 def basin_inside_hull(filtered_df, per_element_sids, centroid_ll):
-    """Return True if centroid_ll is inside the convex hull of qualifying stations.
+    """Return True if centroid_ll is inside the convex hull of per-element stations.
 
-    Used when no start_date is given, so there are no meaningful decades to
-    iterate over.  Checks aggregate coverage: stations with sufficient data
-    anywhere in their record (per_element_sids) form a hull around the centroid
-    for every requested element.  Returns False for any element with < 3 stations.
+    Used when no start_date is given, so there are no meaningful periods to
+    iterate over.  per_element_sids contains all bbox stations with any inventory
+    record for each element; these form a hull that is tested for centroid
+    enclosure.  Returns False for any element with < 3 stations.
     """
     import numpy as np
     from scipy.spatial import Delaunay
