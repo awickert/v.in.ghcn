@@ -585,16 +585,33 @@ def fetch_and_write_monthly_timeseries(station_ids, cat_map, start_date, end_dat
 
 
 def get_sample_centroid_ll(sample_map):
-    """Return (lon, lat) in decimal degrees for the centroid of a polygon map."""
-    out = gs.read_command('v.out.ascii', map=sample_map, format='point',
-                          type='centroid', separator='pipe', quiet=True)
-    lines = [l.strip() for l in out.splitlines() if l.strip()]
-    if not lines:
-        gs.fatal("No centroid found in sample= map '{}'.".format(sample_map))
-    x, y = lines[0].split('|')[:2]
-    proj_out = gs.read_command('m.proj', coordinates='{},{}'.format(x, y),
+    """Return (lon, lat) in decimal degrees for the centroid of a polygon map.
+
+    Tries the explicit centroid feature first; falls back to bbox centre so
+    the function works even if centroid features were not built into the map.
+    """
+    try:
+        out = gs.read_command('v.out.ascii', input=sample_map, format='point',
+                              type='centroid', separator='pipe', quiet=True)
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        if lines:
+            x, y = lines[0].split('|')[:2]
+            proj_out = gs.read_command('m.proj', coordinates='{},{}'.format(x, y),
+                                       flags='od', quiet=True)
+            lon, lat = proj_out.strip().split('|')[:2]
+            return float(lon), float(lat)
+    except Exception:
+        pass
+
+    # Fallback: geographic centre of the map's bounding box
+    info = gs.parse_command('v.info', map=sample_map, flags='g')
+    cx = (float(info['west']) + float(info['east'])) / 2
+    cy = (float(info['south']) + float(info['north'])) / 2
+    proj_out = gs.read_command('m.proj', coordinates='{},{}'.format(cx, cy),
                                flags='od', quiet=True)
     lon, lat = proj_out.strip().split('|')[:2]
+    gs.message("sample= centroid: using bbox centre lon={:.4f} lat={:.4f}".format(
+        float(lon), float(lat)))
     return float(lon), float(lat)
 
 
