@@ -296,14 +296,29 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
             ', '.join(elements)))
 
     sids_in_df = set(df['station_id'])
+    end_yr = int(end_date[:4]) if end_date else date.today().year
 
-    # Compute per-element station IDs (with data in the requested period) and counts.
-    # per_element_sids maps each element to the set of station_ids that have sufficient
-    # coverage for THAT element within the date range — used for convex hull checks.
-    per_element_sids   = {}
+    # per_element_sids: for convex hull checks only — all bbox stations with any
+    # inventory record for the element within the requested date range.  Deliberately
+    # independent of min_years: a station with even one day of data can contribute to
+    # the spatial hull for the period it covers.
+    ef_hull = elem_inv_df[elem_inv_df['element'].isin(elements)].copy()
+    if start_date:
+        start_yr_hull = int(start_date[:4])
+        ef_hull = ef_hull[
+            (ef_hull['lastyear']  >= start_yr_hull) &
+            (ef_hull['firstyear'] <= end_yr)
+        ]
+    per_element_sids = {}
+    for elem in elements:
+        per_element_sids[elem] = (
+            set(ef_hull[ef_hull['element'] == elem]['station_id']) & sids_in_df
+        )
+
+    # per_element_counts + df: apply min_years to control what gets downloaded and
+    # how min_stations is evaluated.
     per_element_counts = {}
     if min_years:
-        end_yr = int(end_date[:4]) if end_date else date.today().year
         ef = elem_inv_df[elem_inv_df['element'].isin(elements)].copy()
         if start_date:
             start_yr = int(start_date[:4])
@@ -318,7 +333,6 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
         for elem in elements:
             sids = (set(ef_sufficient[ef_sufficient['element'] == elem]['station_id'])
                     & sids_in_df)
-            per_element_sids[elem]   = sids
             per_element_counts[elem] = len(sids)
 
         sufficient = set(ef_sufficient['station_id'].unique())
@@ -327,10 +341,7 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
             gs.fatal("No stations pass the min_years={} filter.".format(min_years))
     else:
         for elem in elements:
-            sids = (set(elem_inv_df[elem_inv_df['element'] == elem]['station_id'])
-                    & sids_in_df)
-            per_element_sids[elem]   = sids
-            per_element_counts[elem] = len(sids)
+            per_element_counts[elem] = len(per_element_sids[elem])
 
     gs.message("Found {} station(s) — per element: {}".format(
         len(df),
