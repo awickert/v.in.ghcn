@@ -472,17 +472,6 @@ def report_inventory_hull_gaps(gaps):
             "for these periods.".format(elem, _year_ranges(bad_decades)))
 
 
-def get_cat_map(output):
-    """Return dict mapping station_id → cat from the imported vector map."""
-    raw = gs.read_command('v.db.select', map=output, columns='cat,station_id', flags='c')
-    cat_map = {}
-    for line in raw.strip().splitlines():
-        parts = line.split('|')
-        if len(parts) == 2:
-            cat_map[parts[1].strip()] = int(parts[0].strip())
-    return cat_map
-
-
 def get_mapset_db():
     """Return path to the current mapset's SQLite database, creating the directory if needed."""
     gisenv = gs.gisenv()
@@ -793,6 +782,31 @@ def check_data_decade_hull(cur, table_name, elements, cat_to_xy_ll, centroid_ll,
     return gaps
 
 
+def _hull_criterion(filtered_df, elem_inv_df, per_element_sids,
+                    centroid_ll, start_date, end_date):
+    """Return (ok: bool, inv_gaps: dict) for the appropriate hull check.
+
+    Dispatches on whether start_date is given:
+      start_date set  → per-decade inventory hull via inventory_decade_hull_gaps()
+      start_date None → aggregate hull via basin_inside_hull()
+
+    inventory_decade_hull_gaps() degenerates when start_date is absent (it
+    only checks the current decade), so the aggregate check is used instead.
+
+    Returns (True, {}) when centroid_ll is None or filtered_df is empty.
+    """
+    if not centroid_ll or filtered_df.empty:
+        return True, {}
+    if start_date:
+        gaps = inventory_decade_hull_gaps(
+            filtered_df, elem_inv_df, per_element_sids,
+            centroid_ll, start_date, end_date)
+        return not gaps, gaps
+    else:
+        ok = basin_inside_hull(filtered_df, per_element_sids, centroid_ll)
+        return ok, {} if ok else {'_': ['aggregate hull']}
+
+
 def main():
     options, flags = gs.parser()
     atexit.register(cleanup)
@@ -883,24 +897,8 @@ def main():
                          (not filtered.empty and
                           min(elem_counts.get(el, 0) for el in elements) >= min_stations))
 
-            # Hull criterion depends on whether a date range is specified:
-            #   start_date given → per-decade inventory hull (temporal check)
-            #   no start_date    → aggregate hull (basin_inside_hull), because
-            #     inventory_decade_hull_gaps degenerates to a single current-decade
-            #     check when start_date is None, which is not meaningful.
-            if centroid_ll and not filtered.empty:
-                if start_date:
-                    inv_gaps = inventory_decade_hull_gaps(
-                        filtered, elem_inv_df, elem_sids,
-                        centroid_ll, start_date, end_date)
-                    temporal_hull_ok = not inv_gaps
-                else:
-                    temporal_hull_ok = basin_inside_hull(
-                        filtered, elem_sids, centroid_ll)
-                    inv_gaps = {} if temporal_hull_ok else {'_': ['aggregate hull']}
-            else:
-                inv_gaps = {}
-                temporal_hull_ok = not centroid_ll or filtered.empty
+            temporal_hull_ok, inv_gaps = _hull_criterion(
+                filtered, elem_inv_df, elem_sids, centroid_ll, start_date, end_date)
 
             if counts_ok and temporal_hull_ok:
                 break
@@ -952,10 +950,8 @@ def main():
         filtered, elem_counts, elem_sids = filter_stations(
             station_df, elem_inv_df, bbox, station_ids,
             elements, min_years, start_date, end_date)
-        if centroid_ll and not filtered.empty and start_date:
-            inv_gaps = inventory_decade_hull_gaps(
-                filtered, elem_inv_df, elem_sids,
-                centroid_ll, start_date, end_date)
+        _, inv_gaps = _hull_criterion(
+            filtered, elem_inv_df, elem_sids, centroid_ll, start_date, end_date)
 
     report_temporal_coverage(filtered, elem_inv_df, elements, start_date, end_date)
 
