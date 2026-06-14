@@ -272,7 +272,10 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
 
     sids_in_df = set(df['station_id'])
 
-    # Compute per-element station counts and apply min_years filter
+    # Compute per-element station IDs (with data in the requested period) and counts.
+    # per_element_sids maps each element to the set of station_ids that have sufficient
+    # coverage for THAT element within the date range — used for convex hull checks.
+    per_element_sids   = {}
     per_element_counts = {}
     if min_years:
         end_yr = int(end_date[:4]) if end_date else date.today().year
@@ -288,10 +291,10 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
         ef_sufficient = ef[ef['record_years'] >= min_years]
 
         for elem in elements:
-            per_element_counts[elem] = len(
-                set(ef_sufficient[ef_sufficient['element'] == elem]['station_id'])
-                & sids_in_df
-            )
+            sids = (set(ef_sufficient[ef_sufficient['element'] == elem]['station_id'])
+                    & sids_in_df)
+            per_element_sids[elem]   = sids
+            per_element_counts[elem] = len(sids)
 
         sufficient = set(ef_sufficient['station_id'].unique())
         df = df[df['station_id'].isin(sufficient)]
@@ -299,16 +302,16 @@ def filter_stations(station_df, elem_inv_df, bbox, station_ids, elements, min_ye
             gs.fatal("No stations pass the min_years={} filter.".format(min_years))
     else:
         for elem in elements:
-            per_element_counts[elem] = len(
-                set(elem_inv_df[elem_inv_df['element'] == elem]['station_id'])
-                & sids_in_df
-            )
+            sids = (set(elem_inv_df[elem_inv_df['element'] == elem]['station_id'])
+                    & sids_in_df)
+            per_element_sids[elem]   = sids
+            per_element_counts[elem] = len(sids)
 
     gs.message("Found {} station(s) — per element: {}".format(
         len(df),
         ', '.join('{}={}'.format(e, per_element_counts.get(e, 0)) for e in elements)
     ))
-    return df.reset_index(drop=True), per_element_counts
+    return df.reset_index(drop=True), per_element_counts, per_element_sids
 
 
 def _year_ranges(years):
@@ -615,11 +618,16 @@ def get_sample_centroid_ll(sample_map):
     return float(lon), float(lat)
 
 
-def basin_inside_hull(filtered_df, elem_inv_df, elements, centroid_ll):
+def basin_inside_hull(filtered_df, per_element_sids, centroid_ll):
     """Return True if centroid_ll is inside the station convex hull for every element.
 
-    A hull is formed from stations in filtered_df that carry each element.
-    Returns False for any element with fewer than 3 stations (hull undefined).
+    per_element_sids maps each element to the set of station_ids that have
+    confirmed data coverage for that element within the requested date range
+    (produced by filter_stations). Only those stations contribute to each
+    element's hull, so the check reflects actual data availability, not just
+    inventory presence.
+
+    Returns False for any element with fewer than 3 qualifying stations.
     """
     import numpy as np
     from scipy.spatial import Delaunay
@@ -627,9 +635,8 @@ def basin_inside_hull(filtered_df, elem_inv_df, elements, centroid_ll):
     lon_c, lat_c = centroid_ll
     pt = np.array([[lon_c, lat_c]])
 
-    for elem in elements:
-        elem_sids = set(elem_inv_df[elem_inv_df['element'] == elem]['station_id'])
-        coords = filtered_df[filtered_df['station_id'].isin(elem_sids)][
+    for elem, sids in per_element_sids.items():
+        coords = filtered_df[filtered_df['station_id'].isin(sids)][
             ['longitude', 'latitude']].values.astype(np.float64)
         if len(coords) < 3:
             return False
@@ -721,7 +728,7 @@ def main():
         w, s, e, n = bbox
         expansion = 0.0
         while True:
-            filtered, elem_counts = filter_stations(
+            filtered, elem_counts, elem_sids = filter_stations(
                 station_df, elem_inv_df, (w, s, e, n),
                 None, elements, min_years, start_date, end_date, fatal=False)
 
@@ -730,7 +737,7 @@ def main():
                           min(elem_counts.get(el, 0) for el in elements) >= min_stations))
             hull_ok   = (not centroid_ll or
                          (not filtered.empty and
-                          basin_inside_hull(filtered, elem_inv_df, elements, centroid_ll)))
+                          basin_inside_hull(filtered, elem_sids, centroid_ll)))
 
             if counts_ok and hull_ok:
                 break
@@ -765,7 +772,7 @@ def main():
                 "Station criteria satisfied after {:.1f}° expansion "
                 "({} stations total).".format(expansion, len(filtered)))
     else:
-        filtered, elem_counts = filter_stations(
+        filtered, elem_counts, _ = filter_stations(
             station_df, elem_inv_df, bbox, station_ids,
             elements, min_years, start_date, end_date)
 
